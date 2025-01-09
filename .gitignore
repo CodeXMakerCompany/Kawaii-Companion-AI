@@ -1,0 +1,38 @@
+# Byte-compiled files
+.ai
+*.py[cod]
+__pycache__/
+
+# Distribution/build directories
+build/
+dist/
+*.egg-info/
+
+# Environment and dependencies
+.env/
+.venv/
+venv/
+env/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE/Editor configurations
+.vscode/
+.idea/
+
+# System files
+drivers
+asset
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Secrets
+token.txt
+
+# Other specific files
+test.wav
+model.pt
