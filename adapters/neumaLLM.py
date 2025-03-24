@@ -2,6 +2,7 @@ import json
 from langchain_ollama import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
 from core.constants.main import BASE_ROL
+from core.automation.code.code import CodeInterpreter
 
 # Template with placeholders
 template = """
@@ -20,32 +21,34 @@ class NeumaLLM:
         self.context = ''  # Can be an empty string or any default value
         self.prompt = ''
         self.chain = ''
+        self.rol = BASE_ROL
+        self.codeInterpreter = CodeInterpreter()
     
     def init(self):
         self.chain = ChatPromptTemplate.from_template(template) | self.model
 
     
     def ask(self, question):
-        # Invoke the chain
         response = self.chain.invoke({
-            "role": BASE_ROL,
+            "role": self.rol,
             "context": self.context,
             "question": question
         })
     
-       
         try:
-          
+            # todo fix sometimes the res comes with ``` andrverse tick at end
             if response.strip().startswith("{") and response.strip().endswith("}"):
                 parsed_response = json.loads(response)
-            else:
-                
-                clean_response = response.split("{", 1)[-1].rsplit("}", 1)[0] + "}"
-                parsed_response = json.loads(clean_response)
+            # else:
+            #     clean_response = response.split("{", 1)[-1].rsplit("}", 1)[0] + "}"
+            #     parsed_response = json.loads(clean_response)
             
             # Extract text and code
             aIText = parsed_response.get('text', 'No text available')
             aICode = parsed_response.get('code', None)  # Default to None if no code is present
+            
+            if aICode:
+                CodeInterpreter.open(aICode)
 
             # Update context with user question and AI response
             self.context += f"\nUser: {question}\nAI: {aIText}\nAICODE: {aICode}"
@@ -69,7 +72,7 @@ class NeumaLLM:
         Updates the personality and context dynamically and returns the updated response.
         """
         self.context = f"Your personality has been updated to: {role}\n" + self.context
-       
+        self.rol = role
 
         response = self.chain.invoke({
             "role": role,  # Pass the updated personality

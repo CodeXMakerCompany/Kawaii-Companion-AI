@@ -9,14 +9,17 @@ class EventBus:
         """Register a handler for a specific event."""
         self._events[event_name] = handler
 
-    async def emit_event(self, event_name, data):
+    async def emit_event(self, event_name, data, returnable: bool = False):
         """Emit an event and call the associated handler."""
         if event_name in self._events:
             handler = self._events[event_name]
 
             if asyncio.iscoroutinefunction(handler):
-                await handler(data)  # Await async handlers
+               data = await handler(data)  # Await async handlers
             else:
-                handler(data)  # Call sync handlers directly
+               data = handler(data)  # Call sync handlers directly
+            
+            if returnable:
+                return data
         else:
             raise ValueError(f"No handler registered for event: {event_name}")

@@ -4,15 +4,22 @@ import signal
 import threading
 from deepgram import DeepgramClient, Microphone, LiveOptions, LiveTranscriptionEvents, DeepgramClientOptions
 
+from core.automation.mic.main import MicrophoneManager
 from events.event_bus import EventBus
 from services.speech import SileroSpeech
 
+is_finals = []
 class TranscriptionService:
-    def __init__(self, event_bus: EventBus):
+    def __init__(self, event_bus: EventBus, mode : str = 'CHAT'):
         self.event_bus = event_bus
-        
+        self.mode = 'CHAT'
+        self.microphoneManager = MicrophoneManager()
+        # todo env oclusion fix 
     async def real_time_transcription(self, queue):
+        
         try:
+            micManager = self.microphoneManager
+            print('Mic status', micManager.getMicStatus())
             config = DeepgramClientOptions(options={"keepalive": "true"})
             deepgram = DeepgramClient("", config)
             dg_connection = deepgram.listen.asyncwebsocket.v("1")
@@ -21,29 +28,46 @@ class TranscriptionService:
                 print("Neuma is listening")
 
             async def on_message(self, result, **kwargs):
+                # mute validation to avoid clash between devices streaming audio
+                if microphone.is_muted() and not micManager.getMicStatus():
+                    microphone.unmute()
+          
+                    
                 sentence = result.channel.alternatives[0].transcript
                 if len(sentence) == 0:
                     return
-
                 if result.is_final:
-                    # Send final transcript to queue
-                    await queue.put(sentence)
-                # else:
-                #     transcript_collector.add_part(sentence)
+                # We need to collect these and concatenate them together when we get a speech_final=true
+                # See docs: https://developers.deepgram.com/docs/understand-endpointing-interim-results
+                    is_finals.append(sentence)
 
+                # Speech Final means we have detected sufficent silence to consider this end of speech
+                # Speech final is the lowest latency result as it triggers as soon an the endpointing value has triggered
+                if result.speech_final:
+                    # Concatenate and process the accumulated sentences
+                    utterance = " ".join(is_finals)
+                    if utterance.strip():  # Ensure we don't print empty strings
+                        
+                        await queue.put(utterance)
+                        # Mute the microphone and wait for playback to complete
+                        microphone.mute()
+                        micManager.mute()
+                        
+                    is_finals.clear()
+                    
             dg_connection.on(LiveTranscriptionEvents.Open, on_open)
             dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
 
             # Retry connection
             options = LiveOptions(
-                model="nova-2",
+                 model="nova-2",
                 language="en-US",
                 smart_format=True,
                 encoding="linear16",
-                channels=1,
+                channels=1,           
                 sample_rate=16000,
                 interim_results=True,
-                endpointing=300,
+                endpointing=300,    
             )
             addons = {"no_delay": "true"}
 
@@ -68,6 +92,7 @@ class TranscriptionService:
             stop_event = asyncio.Event()
 
             def handle_shutdown():
+                microphone.finish()
                 stop_event.set()
 
             for sig_name in ('SIGINT', 'SIGTERM'):
@@ -101,8 +126,10 @@ class TranscriptionService:
                 if 'aIText' in result:
                     with ThreadPoolExecutor() as executor:
                         await loop.run_in_executor(executor, SileroSpeech.save_and_play,  result['aIText'] ,'test.wav', set_audio_level)
-                        
+                        self.microphoneManager.unmute()
                     
+                    await self.event_bus.emit_event('logger_handler', {  'agent': True,  'message':  'Neuma is Listening....' }) 
+
             except Exception as e:
                 await self.event_bus.emit_event('logger_handler', {  'error': True,  'message':  e })
                 print(f"Error generating speech: {e}")        

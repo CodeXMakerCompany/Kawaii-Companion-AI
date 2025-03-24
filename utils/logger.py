@@ -5,7 +5,7 @@ from colorama import Fore, Back, Style
 colorama.init(autoreset=True)
 
 username = os.getenv('USERNAME')
-user_name = os.getenv('AI_ASSISTANT_NAME')
+user_name = os.getenv('ASSISTANT_NAME')
 
 class LoggerUtil:
     @staticmethod

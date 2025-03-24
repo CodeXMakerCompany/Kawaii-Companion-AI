@@ -79,7 +79,7 @@ class SileroSpeech:
                 stream.stop_stream()
                 stream.close()
                 p.terminate()
-                print("Neuma is Listening....")
+                
 
         except Exception as e:
             print(f"Error during audio playback: {e}")

@@ -13,16 +13,18 @@ load_dotenv()
 
 from events.handlers import (
     logger_handler,
-    neuma_automations_handler
+    mute,
+    neuma_automations_handler,
+    unmute
 )
 event_bus = EventBus()
 
 event_bus.register_event('logger_handler', logger_handler)
 event_bus.register_event('neuma_automations_handler', neuma_automations_handler)
+event_bus.register_event('mute_mic', mute)
+event_bus.register_event('unmute_mic', unmute)
 
 transcript_queue = asyncio.Queue()
-
-
 async def AiAssistant():
     transcriptionService = TranscriptionService(event_bus)
     vtubeService = VTubeService(
@@ -55,8 +57,6 @@ async def AiAssistant():
         await asyncio.gather(*tasks, return_exceptions=True)
         print("All tasks terminated. Cleaning up.")
     
-
-
 if __name__ == "__main__":
     try:
         loop = asyncio.get_event_loop()
