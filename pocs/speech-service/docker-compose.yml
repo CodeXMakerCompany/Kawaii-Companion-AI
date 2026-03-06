@@ -1,0 +1,36 @@
+version: "3.8"
+
+services:
+  speech-service:
+    build:
+      context: ../..
+      dockerfile: pocs/speech-service/Dockerfile
+    container_name: pneuma-speech-service
+    ports:
+      - "8001:8001"
+    # Mount entire /dev/dri for GPU access
+    devices:
+      - /dev/dri:/dev/dri
+    # Add user to video and render groups for GPU access
+    group_add:
+      - video
+      - render
+    environment:
+      - PYTORCH_ROCM_ARCH=gfx1100 # Adjust for your GPU
+      - HSA_OVERRIDE_GFX_VERSION=11.0.0 # Adjust if needed
+    volumes:
+      - speech-outputs:/tmp/speech_outputs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    # Ensure container has necessary privileges for GPU
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+
+volumes:
+  speech-outputs:

@@ -1,0 +1,7 @@
+node_modules/
+out/
+public/renderer/
+public/shared/
+public/libs/
+*.log
+package-lock.json

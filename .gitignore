@@ -9,8 +9,10 @@ dist/
 *.egg-info/
 
 # Environment and dependencies
+.env
 .env/
 .venv/
+.venv311
 venv/
 env/
 
@@ -32,7 +34,12 @@ Thumbs.db
 
 # Secrets
 token.txt
+vtube_token.txt
 
 # Other specific files
 test.wav
 model.pt
+
+# Speech service outputs
+pocs/speech-service/test_output.wav
+pocs/speech-service/*.wav
