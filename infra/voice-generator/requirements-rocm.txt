@@ -1,0 +1,7 @@
+# ROCm image: do NOT install torch/torchaudio/torchvision — use base image's ROCm stack.
+# coqui-tts 0.27.2 accepts transformers 4.52–4.55; 0.27.3+ require >=4.57.
+transformers>=4.52.1,<4.56
+soundfile
+coqui-tts==0.27.2
+flask
+gunicorn

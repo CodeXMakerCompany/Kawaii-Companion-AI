@@ -1,0 +1,21 @@
+# Electron assistant UI: build app and run with host display (X11)
+FROM node:20-bookworm
+
+# Electron runtime deps on Linux
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgtk-3-0 libnotify4 libnss3 libxss1 libasound2 libxtst6 \
+    libx11-xcb1 libatk-bridge2.0-0 libdrm2 libgbm1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+COPY . .
+RUN npm run build
+
+ENV WAKEUP_WS_URL=ws://wakeup-server:7769
+
+# Run Electron; --no-sandbox often needed in container
+CMD ["npx", "electron", ".", "--no-sandbox"]

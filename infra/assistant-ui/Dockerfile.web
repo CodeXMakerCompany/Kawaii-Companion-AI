@@ -1,0 +1,28 @@
+# Stage 1: build renderer (CSS + JS bundle only; no Electron)
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+COPY postcss.config.js build-renderer.mjs ./
+COPY tsconfig.base.json ./
+COPY src/renderer ./src/renderer
+COPY src/domain ./src/domain
+COPY src/application ./src/application
+COPY src/infrastructure ./src/infrastructure
+COPY src/shared ./src/shared
+
+RUN mkdir -p public/renderer public/libs public/models/SharkGirl
+
+COPY public/index.html public/
+COPY public/libs ./public/libs
+COPY public/models/SharkGirl ./public/models/SharkGirl
+
+RUN npm run build:css && npm run build:renderer
+
+# Stage 2: serve static app
+FROM nginx:alpine
+COPY --from=builder /app/public /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]

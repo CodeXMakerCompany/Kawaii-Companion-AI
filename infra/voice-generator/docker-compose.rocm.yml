@@ -1,0 +1,52 @@
+# AMD Radeon (Sapphire) via ROCm. Single-process (python server.py) to avoid gunicorn fork + GPU crash on /speak.
+# Run: docker compose -f docker-compose.rocm.yml up -d voice-server
+# Wait for healthy (model load ~1–2 min) then: curl -X POST http://localhost:5000/speak -H "Content-Type: application/json" -d '{"text": "hello"}' -o out.wav
+
+services:
+  voice-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: rocm
+    image: voice-generator:rocm
+    platform: linux/amd64
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "110"   # render
+      - "44"    # video (getent group video if 44 fails)
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      - VOICE_SAMPLE=/app/pneuma_voice_sample.wav
+      - COQUI_TOS_AGREED=1
+      # GPU inference still crashes (container restarts after [speak] synthesizing). 1 = stable CPU.
+      - FORCE_TTS_CPU=1
+      # Reddit r/ROCm: expandable_segments:False removes warning and can help; use only dGPU (device 0 = RX 7800 XT).
+      - PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.6,max_split_size_mb:512,expandable_segments:False
+      - CUDA_VISIBLE_DEVICES=0
+      - AMD_SERIALIZE_KERNEL=3
+      # RX 7800 XT (gfx1101). Override + disable SDMA to reduce segfault.
+      - HSA_OVERRIDE_GFX_VERSION=11.0.1
+      - HSA_ENABLE_SDMA=0
+    volumes:
+      - ./pneuma_voice_sample.wav:/app/pneuma_voice_sample.wav:ro
+      - ./server.py:/app/server.py:ro
+      - ./gunicorn_conf.py:/app/gunicorn_conf.py:ro
+    ports:
+      - "5000:5000"
+    # Single-process to avoid gunicorn worker fork + GPU issues (worker was dying on /speak).
+    # For production with gunicorn, ensure worker preload and no GPU use before fork.
+    entrypoint: ["python", "server.py"]
+    ipc: host
+    shm_size: "4g"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:5000/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 180s

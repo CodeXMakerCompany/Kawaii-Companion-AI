@@ -1,0 +1,46 @@
+# Voice generator: text → audio with Coqui TTS (XTTS v2), voice clone from pneuma_voice_sample.wav
+# CPU only — works on Pop!_OS, Docker Desktop, etc. No GPU devices.
+# For AMD GPU (ROCm): use docker-compose -f docker-compose.rocm.yml up
+#
+# If you see "/dev/kfd: no such file or directory", run with the file explicitly:
+#   docker-compose -f docker-compose.yml up --build
+# or: ./run.sh
+# Check: echo $COMPOSE_FILE (should be empty); ensure you're in this directory.
+
+services:
+  voice-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: cpu
+    image: voice-generator:cpu
+    platform: linux/amd64
+    environment:
+      - VOICE_SAMPLE=/app/assets/pneuma_voice_sample.wav
+      - COQUI_TOS_AGREED=1
+    devices: []   # CPU only; no /dev/kfd or /dev/dri
+    volumes:
+      - ../../assets:/app/assets:ro
+      - ./output:/app/output
+    command: ["hello codexmaker seems all is fine so far", "-o", "/app/output/hello.wav"]
+    shm_size: "2g"
+
+  # HTTP server: POST /speak with {"text": "..."} → synthesize, play, delete file
+  voice-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: cpu
+    image: voice-generator:cpu
+    platform: linux/amd64
+    environment:
+      - VOICE_SAMPLE=/app/pneuma_voice_sample.wav
+      - COQUI_TOS_AGREED=1
+    devices: []
+    volumes:
+      - ./pneuma_voice_sample.wav:/app/pneuma_voice_sample.wav:ro
+      - ./server.py:/app/server.py:ro
+    ports:
+      - "5000:5000"
+    entrypoint: ["python", "server.py"]
+    shm_size: "2g"

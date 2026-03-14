@@ -1,0 +1,12 @@
+# Don't send these to the build context
+node_modules
+out
+.git
+.gitignore
+*.log
+*.md
+live2d-models
+Dockerfile
+Dockerfile.web
+docker-compose.yml
+.dockerignore

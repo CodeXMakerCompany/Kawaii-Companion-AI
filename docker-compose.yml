@@ -1,0 +1,51 @@
+version: "3.8"
+
+services:
+  assistant-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: assistant-websocket-server
+    ports:
+      - "7769:7769"
+    environment:
+      - ASSISTANT_NAME=${ASSISTANT_NAME:-NEUMA}
+      - USERNAME=${USERNAME}
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1:8b}
+    env_file:
+      - .env
+    volumes:
+      - ./adapters:/app/adapters
+      - ./core:/app/core
+      - ./events:/app/events
+      - ./services:/app/services
+      - ./assets:/app/assets
+      - ./outputs:/app/outputs
+    restart: unless-stopped
+    networks:
+      - assistant-network
+
+  # Electron app (Linux + X11 only). Default: use ./scripts/start-assistant.sh to open UI on host.
+  # To run UI in Docker on Linux: xhost +local:docker && docker compose --profile ui up
+  assistant-ui:
+    profiles:
+      - ui
+    build:
+      context: infra/assistant-ui
+      dockerfile: Dockerfile.electron
+    container_name: assistant-ui
+    environment:
+      - DISPLAY=${DISPLAY}
+      - WAKEUP_WS_URL=ws://assistant-server:7769
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    depends_on:
+      - assistant-server
+    networks:
+      - assistant-network
+
+networks:
+  assistant-network:
+    driver: bridge

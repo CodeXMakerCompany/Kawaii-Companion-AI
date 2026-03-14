@@ -1,0 +1,16 @@
+# Build output
+out/
+node_modules/
+public/renderer/
+public/application/
+public/domain/
+public/infrastructure/
+public/libs/
+public/models/
+
+# Lockfiles and generated
+package-lock.json
+*.min.js
+
+# Docs (optional: remove to format .md)
+# *.md

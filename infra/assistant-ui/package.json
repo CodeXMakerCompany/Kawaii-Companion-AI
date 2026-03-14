@@ -1,0 +1,40 @@
+{
+  "name": "electron-live2d-poc",
+  "version": "0.1.0",
+  "private": true,
+  "main": "out/main/main.js",
+  "scripts": {
+    "build": "npm run build:main && npm run build:preload && npm run build:css && npm run build:renderer",
+    "build:main": "tsc -p tsconfig.main.json",
+    "build:preload": "tsc -p tsconfig.preload.json",
+    "build:css": "node -e \"require('fs').mkdirSync('public/renderer',{recursive:true})\" && npx postcss src/renderer/index.css -o public/renderer/styles.css",
+    "build:renderer": "node build-renderer.mjs",
+    "start": "npm run build && electron .",
+    "dev": "npm run build && electron . --host=localhost --port=12393",
+    "backend": "node out/backend/server.js",
+    "build:backend": "tsc -p tsconfig.backend.json",
+    "build:all": "npm run build && npm run build:backend",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.2.1",
+    "@types/node": "^20.10.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.5.0",
+    "autoprefixer": "^10.4.27",
+    "electron": "^28.0.0",
+    "esbuild": "^0.27.3",
+    "postcss": "^8.5.8",
+    "postcss-cli": "^11.0.1",
+    "prettier": "^3.8.1",
+    "tailwindcss": "^4.2.1",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "ws": "^8.14.0"
+  }
+}

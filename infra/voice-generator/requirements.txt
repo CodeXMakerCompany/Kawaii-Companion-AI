@@ -1,0 +1,11 @@
+# Coqui TTS for voice cloning (XTTS v2). PyTorch from base image.
+# Pin transformers: newer versions removed isin_mps_friendly, which TTS still imports.
+transformers>=4.42.0,<4.47.0
+# Pin torchaudio: 2.9+ defaults to torchcodec for load(); we use soundfile path.
+torchaudio>=2.0,<2.9
+# Pin torchvision: avoid "operator torchvision::nms does not exist" with ROCm/custom PyTorch (guard in 0.19+).
+torchvision>=0.19.0,<0.21
+soundfile
+coqui-tts>=0.22.0
+flask
+gunicorn
