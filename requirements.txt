@@ -1,0 +1,8 @@
+# Kawaii Girl overlay. Install: uv venv .venv && uv pip install --python .venv/bin/python -r requirements.txt
+faster-whisper==1.2.1
+kokoro-onnx==0.6.1
+live2d-py==1.0.0
+numpy==2.5.5
+pillow==13.0.0
+pyopengl==3.1.10
+pywayland==0.4.19

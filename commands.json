@@ -1,0 +1,205 @@
+{
+ "_about": "Voice commands, matched without accents or punctuation. Each app answers to '<open verb> <name>' and '<close verb> <name>' (names include common Whisper mishearings). 'commands' holds exact phrases, including the ones learned from the AI after they ran successfully.",
+ "verbs": {
+  "open": [
+   "open",
+   "launch",
+   "start",
+   "run",
+   "abre",
+   "abrir",
+   "abreme",
+   "inicia",
+   "iniciar",
+   "lanza",
+   "ejecuta",
+   "pon"
+  ],
+  "close": [
+   "close",
+   "quit",
+   "exit",
+   "kill",
+   "stop",
+   "cierra",
+   "cerrar",
+   "cierrame",
+   "termina",
+   "salir de",
+   "sal de",
+   "apaga"
+  ]
+ },
+ "apps": [
+  {
+   "label": "Brave",
+   "names": [
+    "brave",
+    "brave browser",
+    "breiv"
+   ],
+   "open": "brave-browser",
+   "close": "pkill -o -x brave"
+  },
+  {
+   "label": "Firefox",
+   "names": [
+    "firefox",
+    "fire fox"
+   ],
+   "open": "firefox",
+   "close": "pkill -o -x firefox"
+  },
+  {
+   "label": "Chrome",
+   "names": [
+    "chrome",
+    "google chrome",
+    "crom"
+   ],
+   "open": "gtk-launch com.google.Chrome",
+   "close": "pkill -o -x chrome || flatpak kill com.google.Chrome"
+  },
+  {
+   "label": "Files",
+   "names": [
+    "files",
+    "the files",
+    "file manager",
+    "archivos",
+    "los archivos",
+    "gestor de archivos",
+    "explorador de archivos",
+    "explorador"
+   ],
+   "open": "gtk-launch com.system76.CosmicFiles",
+   "close": "pkill -o -x cosmic-files"
+  },
+  {
+   "label": "Claude",
+   "names": [
+    "claude",
+    "claude desktop",
+    "cloud",
+    "clod",
+    "claud",
+    "clodi"
+   ],
+   "open": "gtk-launch com.anthropic.Claude",
+   "close": "pkill -o -x claude-desktop"
+  },
+  {
+   "label": "Warp",
+   "names": [
+    "warp",
+    "warp terminal",
+    "worp",
+    "guarp",
+    "la terminal warp"
+   ],
+   "open": "gtk-launch dev.warp.Warp",
+   "close": "pkill -o -x warp"
+  },
+  {
+   "label": "Kiro",
+   "names": [
+    "kiro",
+    "quiro",
+    "kero",
+    "kiro ide"
+   ],
+   "open": "gtk-launch kiro",
+   "close": "pkill -o -x kiro"
+  },
+  {
+   "label": "Slack",
+   "names": [
+    "slack",
+    "slac",
+    "eslac"
+   ],
+   "open": "gtk-launch com.slack.Slack",
+   "close": "pkill -o -x slack || flatpak kill com.slack.Slack"
+  },
+  {
+   "label": "Cursor",
+   "names": [
+    "cursor",
+    "cursor ide",
+    "korser"
+   ],
+   "open": "gtk-launch cursor",
+   "close": "pkill -o -x cursor"
+  },
+  {
+   "label": "Obsidian",
+   "names": [
+    "obsidian",
+    "obsidiana",
+    "obsidian notes"
+   ],
+   "open": "gtk-launch md.obsidian.Obsidian",
+   "close": "pkill -o -x obsidian || flatpak kill md.obsidian.Obsidian"
+  },
+  {
+   "label": "Steam",
+   "names": [
+    "steam",
+    "stim",
+    "estim"
+   ],
+   "open": "gtk-launch com.valvesoftware.Steam",
+   "close": "pgrep -x steam >/dev/null && flatpak run com.valvesoftware.Steam -shutdown"
+  },
+  {
+   "label": "MongoDB",
+   "names": [
+    "mongodb",
+    "mongo db",
+    "mongo",
+    "mongodb compass",
+    "compass"
+   ],
+   "open": "gtk-launch com.mongodb.Compass",
+   "close": "pkill -o -x 'MongoDB Compass' || flatpak kill com.mongodb.Compass"
+  }
+ ],
+ "commands": [
+  {
+   "phrases": [
+    "open steam"
+   ],
+   "run": "gtk-launch com.valvesoftware.Steam",
+   "say": "Opening Steam",
+   "source": "ai",
+   "added": "2026-11-19 18:08"
+  },
+  {
+   "phrases": [
+    "open the steam"
+   ],
+   "run": "gtk-launch com.valvesoftware.Steam",
+   "say": "Opening Steam",
+   "source": "ai",
+   "added": "2026-11-19 18:08"
+  },
+  {
+   "phrases": [
+    "close cursor"
+   ],
+   "run": "gdbus call --session --dest cursor --object-path /org/freedesktop/Application/cursor/default --method org.freedesktop.Application.Quit",
+   "say": "Close cursor",
+   "source": "ai",
+   "added": "2026-11-19 18:08"
+  },
+  {
+   "phrases": [
+    "abre el gestor de archivos"
+   ],
+   "run": "gtk-launch com.system76.CosmicFiles",
+   "say": "Abriendo el gestor de archivos",
+   "source": "ai",
+   "added": "2026-11-19 19:57"
+  }
+ ]
+}

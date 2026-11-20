@@ -1,0 +1,44 @@
+{
+  "_about": "Mini button labels for this model's expressions, grouped. Names come from the parameter names in model.cdi3.json (Chinese in brackets).",
+  "groups": [
+    {"name": "Poses", "moves": [
+      ["expression1", "Poke"],
+      ["expression2", "Mic"],
+      ["expression3", "Heart"],
+      ["expression4", "Claws"],
+      ["expression5", "Peace"],
+      ["expression16", "Lollipop"]
+    ]},
+    {"name": "Face", "moves": [
+      ["expression14", "Happy"],
+      ["expression7", "Love"],
+      ["expression8", "Stars"],
+      ["expression13", "Shock"],
+      ["expression12", "Huh?"],
+      ["expression11", "Angry"],
+      ["expression6", "Cry"],
+      ["expression9", "Meh"],
+      ["expression10", "Sweat"],
+      ["expression15", "Bandaid"]
+    ]},
+    {"name": "Outfit", "moves": [
+      ["expression17", "No hat"],
+      ["expression18", "No coat"],
+      ["expression19", "Boots"],
+      ["expression20", "Tail up"],
+      ["expression21", "Bun R"],
+      ["expression22", "Bun L"],
+      ["expression23", "Chibi"]
+    ]}
+  ],
+  "_source": {
+    "expression1": "点点 poke", "expression2": "麦克 mic", "expression3": "笔芯 finger heart",
+    "expression4": "抓抓 claws", "expression5": "比耶 peace sign", "expression6": "哭哭 crying",
+    "expression7": "爱心 love heart", "expression8": "星星眼 starry eyes", "expression9": "无语 speechless",
+    "expression10": "汗 sweat", "expression11": "生气 angry", "expression12": "疑问 question",
+    "expression13": "惊讶 surprised", "expression14": "超开心 super happy", "expression15": "创可贴 band-aid",
+    "expression16": "棒棒糖 lollipop", "expression17": "头顶鲨鱼 shark hat", "expression18": "外套 jacket",
+    "expression19": "堆堆袜 slouch socks", "expression20": "尾巴 tail", "expression21": "右啾啾 right bun",
+    "expression22": "左啾啾 left bun", "expression23": "q版 chibi"
+  }
+}

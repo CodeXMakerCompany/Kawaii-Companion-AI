@@ -1,0 +1,64 @@
+{
+ "_about": "What she says out loud (Kokoro voice below). Several options per moment: she picks one at random and never repeats the last. {app}, {title} and {message} are filled in. App-specific lines are mixed with the general ones.",
+ "voice": "af_heart",
+ "speed": 1.05,
+
+ "open": [
+  "Opening {app} for you!",
+  "{app}, coming right up!",
+  "Okay! Launching {app}.",
+  "Here comes {app}!"
+ ],
+ "close": [
+  "Closing {app}. Bye bye!",
+  "Okay, {app} is closed!",
+  "{app} is going to sleep now.",
+  "All done with {app}? Closing it!"
+ ],
+ "apps": {
+  "Brave": {"open": ["Brave is on its way. Happy browsing!"], "close": ["Bye bye, Brave! See you soon."]},
+  "Firefox": {"open": ["Here comes the fox! Firefox is opening."], "close": ["The little fox is going home. Firefox closed!"]},
+  "Chrome": {"open": ["Chrome, coming up! Try not to open a hundred tabs, okay?"], "close": ["Chrome is closed. Your memory says thank you!"]},
+  "Files": {"open": ["Opening your files. Let's find it together!"], "close": ["Files closed. Everything's nice and tidy."]},
+  "Claude": {"open": ["Opening Claude! Say hi from me."], "close": ["Closing Claude. Talk to you later!"]},
+  "Warp": {"open": ["Warp terminal, engage! Time to type some magic."], "close": ["Warp is closed. No more commands for now!"]},
+  "Kiro": {"open": ["Here's Kiro! Let's build something cool."], "close": ["Closing Kiro. Great work today!"]},
+  "Slack": {"open": ["Opening Slack. Don't let the pings scare you!"], "close": ["Slack is closed. Ahh, peace and quiet."]},
+  "Cursor": {"open": ["Cursor is ready. Let's write some code!"], "close": ["Closing Cursor. Don't forget to commit!"]},
+  "Obsidian": {"open": ["Opening Obsidian. Time to write down those big ideas!"], "close": ["Obsidian is closed. Your notes are safe with me."]},
+  "Steam": {"open": ["Steam is starting! Game time? Just one match, okay?"], "close": ["Closing Steam. Back to work, hero!"]},
+  "MongoDB": {"open": ["Opening MongoDB Compass. Let's peek at that data!"], "close": ["Compass is closed. Your collections can rest now."]}
+ },
+
+ "not_open": ["{app} isn't open right now.", "Hmm, I can't find {app} running."],
+ "open_failed": ["Oops! {app} didn't want to open.", "Uh oh, I couldn't start {app}."],
+ "confirm_ai": [
+  "I found this command. Wanna check it first?",
+  "I think this one will do it! Wanna take a look before I run it?",
+  "Found something! Check it first, okay?"
+ ],
+ "learned": ["Got it! I'll remember that one.", "Yay, it worked! I saved it for next time."],
+ "ran": ["Done!", "All set!", "There you go!"],
+ "ai_failed": ["That command didn't work, so I won't save it.", "Hmm, that one failed. I won't remember it."],
+ "refused": ["Sorry, that one looks too dangerous for me.", "I'd rather not run that. It could break something!"],
+ "not_heard": ["Hmm, I didn't catch that. Try again?", "Sorry, could you say that again?"],
+ "no_command": ["I couldn't find a command for that, sorry!", "Hmm, I'm not sure how to do that one."],
+ "ai_down": ["My AI helpers are busy right now. Let's try again in a bit!"],
+ "cancelled": ["Okay, I won't run it.", "Cancelled! No worries."],
+ "greet": ["Hi there! It's so nice to see you!", "Hello hello! What are we doing today?", "Hey! I'm right here if you need me."],
+
+ "reminder_today": ["Hey! Don't forget: {title}!", "Reminder time! {title}."],
+ "reminder_overdue": ["Psst, this one is still waiting for you: {title}.", "Don't forget about {title}! It's still pending."],
+ "alarms": {
+  "cpu": "Heads up! Your CPU is working really hard.",
+  "mem": "Your memory is almost full. Maybe close something?",
+  "swap": "Your computer is swapping a lot. Things might get slow.",
+  "disk": "Your disk is almost full!",
+  "vram": "Your graphics memory is almost full.",
+  "cpu_temp": "Your CPU is getting really hot!",
+  "gpu_temp": "Your graphics card is getting really hot!",
+  "nvme_temp": "Your SSD is running hot.",
+  "load": "Your computer is super busy right now.",
+  "battery": "A battery is running low. Time to charge it!"
+ }
+}
