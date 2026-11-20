@@ -24,6 +24,8 @@ Resource choices
   - No MSAA, no depth/stencil, and only her area is drawn.
   - Uses the downscaled texture from build_model.py (2048px instead of 8192px).
   - The UI is painted once into a texture and only repainted when it changes.
+  - Click effects (fx.py) are drawn only while one plays, cropped to what they cover, at 60 fps;
+    --no-fx, or the desktop's animations switch, turns them off.
   - Transparent pixels are left out of the input region, so clicks there reach the desktop.
 """
 
@@ -36,6 +38,7 @@ import math
 import os
 import random
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -54,6 +57,7 @@ with contextlib.redirect_stdout(io.StringIO()):  # live2d-py prints a banner on 
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))  # run.sh uses python -I, which leaves the script dir off sys.path
+from fx import Effects, Press
 from sysmon import SystemMonitor
 from speech import Speaker
 from voice import VoiceAssistant
@@ -398,9 +402,10 @@ class OverlayTexture:
         GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex)
         GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA8, w, h, 0, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, None)
 
-    def upload(self, data):
+    def upload(self, data, fmt=GL.GL_RGBA):
+        """fmt: GL_BGRA for cairo surfaces (premultiplied too)."""
         GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex)
-        GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, self.w, self.h, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, data)
+        GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, self.w, self.h, fmt, GL.GL_UNSIGNED_BYTE, data)
 
     def draw(self, x=0, y=0, window_h=None):
         """x, y: top-left in window coords (window_h needed to flip to GL's bottom-left)."""
@@ -497,6 +502,16 @@ def replace_running_copy(timeout=4.0):
             os.kill(pid, signal.SIGKILL)
 
 
+def animations_enabled():
+    """The desktop's reduce-motion switch (GNOME's enable-animations); on when unknown."""
+    try:
+        out = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface", "enable-animations"],
+                             capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return out.stdout.strip() != "false"
+
+
 def is_portrait(output):
     return bool(output and output.h > output.w)
 
@@ -523,6 +538,8 @@ def parse_args():
     ap.add_argument("--fps", type=float, default=30, help="frame cap (default 30)")
     ap.add_argument("--scale", type=float, help="fixed model zoom instead of fitting her to the area")
     ap.add_argument("--pendings", action="store_true", help="start with the Pendings list open")
+    ap.add_argument("--no-fx", action="store_true",
+                    help="no sakuga effects on clicks (also off when the desktop turns animations off)")
     ap.add_argument("--snapshot", type=Path, help="render ~2.5s, save a PNG with alpha and exit")
     ap.add_argument("--allow-multiple", action="store_true", help="keep other running copies instead of replacing them")
     return ap.parse_args()
@@ -588,6 +605,10 @@ def main():
     overlay.moves = move_groups
     overlay_tex = OverlayTexture(win.width, win.height)
     monitor_tex = OverlayTexture(1, 1)  # the monitor's own small layer: its numbers change every 2s
+    effects = Effects(enabled=not args.no_fx and animations_enabled())
+    fx_tex = OverlayTexture(1, 1)  # the effects' layer, only drawn while one is alive
+    presses = {}  # (kind, name) -> Press, for buttons springing back from a click
+    after_paint = []  # effects placed by the next repaint's layout (the caret, a new bubble)
 
     view = {
         "left": left,  # button column width: PANEL_W on wide screens, 0 on portrait ones
@@ -631,6 +652,13 @@ def main():
         "was_moving": False,
         "silhouette_due": None,
         "region_dirty": True,
+        "flash_until": None,  # end of a button's inverted impact frame
+        "pose_seen": None,  # last pose label, to flash on each new pose
+        "next_pulse": 0.0,  # mic ring while listening
+        "next_rumble": 0.0,  # ゴゴゴゴ while dancing
+        "next_step": 0.0,  # dust while walking
+        "walk_x": 0.0,
+        "banner_shown": False,
     }
 
     def set_transform(scale, offset):
@@ -778,7 +806,21 @@ def main():
                     speaker.say(said)
         if not (said and speaker.available):
             talker.start(time.perf_counter(), 3)  # no voice: at least move her mouth
+        bubble = overlay.rect_of("alert") or overlay.rect_of("monitor_toggle")
+        if bubble:
+            effects.nudge(bubble)
         view["dirty"] = True
+
+    def head():
+        """Top centre of her (window coords), for effects on her."""
+        box, (mw, _) = view["body_box"], view["size"]
+        x = view["left"] + ((box[0] + box[1]) / 2 if box else mw / 2)
+        return x, overlay.head_y if overlay.head_y is not None else NOTES_H + 16
+
+    def impact_frame(hit):
+        """The button turns inside out for an instant, then springs back."""
+        overlay.flash = hit
+        view["flash_until"] = time.perf_counter() + 0.19
 
     def look_at(x, y):
         mw, mh = view["size"]
@@ -861,10 +903,21 @@ def main():
                 win.set_cursor(cursor_for(overlay.hit(x, y)))
             return
         hit = overlay.hit(x, y)
+        rect = overlay.rect_of(*hit) if hit else None
+        if hit and hit[0] in ("button", "action", "move") and button == BTN_LEFT:
+            presses[hit] = Press()
         if hit == ("button", "pendings") and button == BTN_LEFT:
             set_open(not view["open"])
+            if view["open"]:
+                effects.pop(rect)
+            else:
+                effects.poof(rect[2] - 16, (rect[1] + rect[3]) / 2)
         elif hit == ("button", "calendar") and button == BTN_LEFT:
             set_calendar(not view["cal_open"])
+            if view["cal_open"]:
+                effects.pop(rect)
+            else:
+                effects.poof(rect[2] - 16, (rect[1] + rect[3]) / 2)
         elif hit and hit[0] in ("cal_prev", "cal_next") and button == BTN_LEFT:
             y_, m_ = view["cal_month"]
             m_ += -1 if hit[0] == "cal_prev" else 1
@@ -875,50 +928,96 @@ def main():
             day = datetime.date.fromisoformat(hit[1])
             view["cal_month"] = (day.year, day.month)  # clicking a greyed day jumps to its month
             view["dirty"] = True
+            effects.pick(rect)
         elif hit == ("cal_save", None) and button == BTN_LEFT:
+            if view["cal_draft"].strip():
+                effects.tap(rect)
             save_reminder()
         elif hit == ("cal_new", None) and button == BTN_LEFT:
             view.update(cal_editing=None, cal_draft="", cal_yearly=False, dirty=True)
         elif hit == ("cal_yearly", None) and button == BTN_LEFT:
             view.update(cal_yearly=not view["cal_yearly"], dirty=True)
         elif hit == ("cal_delete", None) and button == BTN_LEFT:
+            effects.scrap(rect)
             events.remove(view["cal_editing"])
             view.update(cal_editing=None, cal_draft="", cal_yearly=False, dirty=True, next_alert_check=0.0)
         elif hit and hit[0] == "cal_done" and button == BTN_LEFT:
             events.toggle_done(hit[1])
             view.update(dirty=True, next_alert_check=0.0)
+            cx, cy = (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2
+            if events.is_done(events.get(hit[1])):
+                effects.check(cx, cy)
+            else:
+                effects.poof(cx, cy)
         elif hit and hit[0] == "cal_event":
             if button == BTN_LEFT:
                 edit_reminder(hit[1])
             elif button == BTN_RIGHT:
+                effects.scrap(rect)
                 events.remove(hit[1])
                 if view["cal_editing"] == hit[1]:
                     view.update(cal_editing=None, cal_draft="")
                 overlay.hover = None
                 view.update(dirty=True, next_alert_check=0.0)
         elif hit and hit[0] == "alert_action" and button == BTN_LEFT:
+            effects.tap(rect)
             handle_alert(hit[1])
         elif hit == ("mic", None) and button == BTN_LEFT:
             assistant.toggle()
+            view["next_pulse"] = 0.0
         elif hit and hit[0] in ("voice_run", "voice_cancel") and button == BTN_LEFT:
+            if hit[0] == "voice_run":
+                effects.impact(rect)
+            else:
+                effects.poof((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
             assistant.confirm(hit[0] == "voice_run")
         elif hit == ("monitor_toggle", None) and button == BTN_LEFT:
             view["mon_open"] = not view["mon_open"]
             state["monitor_open"] = view["mon_open"]
             save_state(state)
             view.update(mon_key=None, dirty=True)
+            if view["mon_open"]:  # the panel's size is known once it is painted
+                after_paint.append(lambda: overlay.rect_of("monitor_panel") and effects.bubble(
+                    overlay.rect_of("monitor_panel"), overlay.rect_of("monitor_toggle")))
+            else:
+                effects.poof(rect[0] + 14, (rect[1] + rect[3]) / 2)
         elif hit in (("button", "dance"), ("button", "pose"), ("action", "walk"), ("action", "greet")) \
                 and button == BTN_LEFT:
-            toggle_routine({"dance": dancer, "pose": poser, "walk": walker, "greet": greeter}[hit[1]])
+            routine = {"dance": dancer, "pose": poser, "walk": walker, "greet": greeter}[hit[1]]
+            toggle_routine(routine)
             if hit[1] == "greet" and greeter.active:
                 speaker.react("greet")
+            if not routine.active:
+                effects.poof(rect[2] - 12, (rect[1] + rect[3]) / 2)
+            elif hit[1] == "dance":
+                impact_frame(hit)
+                effects.impact(rect)
+            elif hit[1] == "pose":
+                effects.pick(rect)  # each pose then flashes as it comes up
+            elif hit[1] == "walk":
+                effects.pick(rect)
+                effects.stride(head()[0], win.height - 24)
+            else:
+                effects.pick(rect)
+                effects.hello(*head())
         elif hit == ("button", "talk") and button == BTN_LEFT:
             if talker.active:
                 talker.stop()
+                effects.poof(rect[2] - 12, (rect[1] + rect[3]) / 2)
             else:
                 talker.start(time.perf_counter(), TALK_SECONDS)
+                effects.chatter(*head())
             view["dirty"] = True
         elif hit and hit[0] == "move" and button == BTN_LEFT:
+            if hit[1] is None:  # Clear all: a puff off every move that was on
+                for exp in active:
+                    r = overlay.rect_of("move", exp)
+                    if r:
+                        effects.poof((r[0] + r[2]) / 2, (r[1] + r[3]) / 2, size=5)
+            elif hit[1] in active:
+                effects.poof(rect[2] - 8, (rect[1] + rect[3]) / 2, size=5)
+            else:
+                effects.pick(rect)
             toggle_move(hit[1])
         elif hit and hit[0] == "moves_toggle" and button == BTN_LEFT:
             view["moves_open"] = not view["moves_open"]
@@ -927,9 +1026,15 @@ def main():
             overlay.hover = None
             view["dirty"] = True
         elif hit and hit[0] == "item":
+            box = (rect[0] + 21.5, rect[1] + 11.5)  # its checkbox
             if button == BTN_LEFT:
                 pendings.toggle(hit[1])
+                if pendings.items[hit[1]]["done"]:
+                    effects.check(*box)
+                else:
+                    effects.poof(*box)
             elif button == BTN_RIGHT:
+                effects.scrap(rect)
                 pendings.remove(hit[1])
                 overlay.hover = None
             view["dirty"] = True
@@ -953,6 +1058,9 @@ def main():
         elif view["open"]:
             view["draft"] += text
             view["dirty"] = True
+        else:
+            return
+        after_paint.append(lambda: overlay.caret and effects.dust(*overlay.caret))  # where the caret moved to
 
     def on_key(key, pressed):
         if not pressed:
@@ -964,6 +1072,8 @@ def main():
             if key == KEY_ESC:
                 set_calendar(False)
             elif key in (KEY_ENTER, KEY_KPENTER):
+                if view["cal_draft"].strip() and overlay.rect_of("cal_save"):
+                    effects.tap(overlay.rect_of("cal_save"))
                 save_reminder()
             elif key == KEY_BACKSPACE and view["cal_draft"]:
                 if win.xkb.ctrl():
@@ -979,6 +1089,8 @@ def main():
                 text = view["draft"].strip()
                 if text:
                     pendings.add(text)
+                    new = len(pendings.items) - 1
+                    after_paint.append(lambda: overlay.rect_of("item", new) and effects.done(overlay.rect_of("item", new)))
                 view["draft"] = ""
                 view["dirty"] = True
             elif key == KEY_BACKSPACE and view["draft"]:
@@ -1034,7 +1146,7 @@ def main():
             win.pump(next_frame - now)
             continue
         # Smooth 60 fps while being dragged or resized, the normal cap otherwise.
-        frame = 1.0 / (max(args.fps, 60) if view["drag"] else args.fps)
+        frame = 1.0 / (max(args.fps, 60) if view["drag"] or effects.busy else args.fps)
         next_frame += frame
         if next_frame < now:  # fell behind (suspend, stall): resync instead of bursting
             next_frame = now + frame
@@ -1133,6 +1245,7 @@ def main():
             ids = {a["id"] for a in waiting}
             if ids - view["alert_ids"]:
                 view["next_nag"] = now + 1.0  # a beat after it appears
+                after_paint.append(lambda: overlay.rect_of("alert") and effects.land(overlay.rect_of("alert")))
             if not ids:
                 view["next_nag"] = None
             if ids != view["alert_ids"]:
@@ -1216,6 +1329,41 @@ def main():
                     view["dirty"] = True
                 view["region_dirty"] = True
 
+        # Effects that follow what she is doing, and buttons springing back from a press.
+        if view["flash_until"] and now >= view["flash_until"]:
+            view.update(flash_until=None, dirty=True)
+            overlay.flash = None
+        for key, p in list(presses.items()):
+            squash = p.step(dt)
+            if squash:
+                overlay.squash[key] = squash
+            else:
+                del presses[key]
+                overlay.squash.pop(key, None)
+            view["dirty"] = True
+        hx, hy = head()
+        if poser.label() != view["pose_seen"]:
+            view["pose_seen"] = poser.label()
+            if poser.label():
+                effects.flash(hx + 60, hy + 40)
+        if dancer.active and now >= view["next_rumble"]:
+            if view["next_rumble"]:
+                effects.rumble(hx + random.choice((-1, 1)) * 80, hy + 60)
+            view["next_rumble"] = now + 4.5
+        elif not dancer.active:
+            view["next_rumble"] = 0.0
+        if walk:
+            x_now = hx + shift_x * max(mw, mh) / 2
+            if walker.active and now >= view["next_step"]:
+                view["next_step"] = now + 1.0 / Walker.STEPS_PER_SEC
+                effects.step(x_now, win.height - 20, 1 if x_now >= view["walk_x"] else -1)
+            view["walk_x"] = x_now
+        if assistant.state == "listening" and now >= view["next_pulse"]:
+            view["next_pulse"] = now + 0.9
+            mic = overlay.rect_of("mic")
+            if mic:
+                effects.pulse((mic[0] + mic[2]) / 2, (mic[1] + mic[3]) / 2, 18)
+
         if view["dirty"] or view["mon_dirty"]:  # hover/size changes affect the pill too
             mon = monitor.view(view["mon_open"])
             if mon:
@@ -1237,9 +1385,25 @@ def main():
                                                      "error": view["voice_error"], "command": view["voice_command"]}))
             view["dirty"] = False
             view["region_dirty"] = True  # card size or handles may have changed
+            banner = overlay.rect_of("voice_banner")
+            if banner and not view["banner_shown"]:
+                effects.land(banner, word=None)
+            view["banner_shown"] = bool(banner)
+            for place in after_paint:
+                place()
+            after_paint.clear()
         if view["mon_shape"]:  # under the main layer, so open cards cover the monitor panel
             monitor_tex.draw(*view["mon_pos"], window_h=win.height)
         overlay_tex.draw()
+        effects.bounds = (win.width, win.height)
+        effects.update(dt)
+        drawn = effects.render()
+        if drawn:  # on top of everything; clicks still go through (not in the input region)
+            data, (fx_x, fx_y, fx_w, fx_h) = drawn
+            if (fx_w, fx_h) != (fx_tex.w, fx_tex.h):
+                fx_tex.resize(fx_w, fx_h)
+            fx_tex.upload(data, GL.GL_BGRA)
+            fx_tex.draw(fx_x, fx_y, window_h=win.height)
 
         if view["region_dirty"] and not view["drag"]:
             ui = [(x0, y0, x1 - x0, y1 - y0) for kind, _, (x0, y0, x1, y1) in overlay.regions if kind != "item"]

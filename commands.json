@@ -200,6 +200,33 @@
    "say": "Abriendo el gestor de archivos",
    "source": "ai",
    "added": "2026-11-19 19:57"
+  },
+  {
+   "phrases": [
+    "ping google to see if it s active"
+   ],
+   "run": "ping -c 4 google.com",
+   "say": "Pinging google.com four times to check connectivity.",
+   "source": "ai",
+   "added": "2026-11-19 20:21"
+  },
+  {
+   "phrases": [
+    "power of the pc if you can t search for a comment"
+   ],
+   "run": "gtk-launch com.system76.CosmicSettings.Power",
+   "say": "Opening Power settings — I can't shut down or reboot the machine, but here are the power options.",
+   "source": "ai",
+   "added": "2026-11-19 20:21"
+  },
+  {
+   "phrases": [
+    "opelny slack"
+   ],
+   "run": "gtk-launch com.slack.Slack",
+   "say": "Abriendo Slack",
+   "source": "ai",
+   "added": "2026-11-20 07:50"
   }
  ]
 }

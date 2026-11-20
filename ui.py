@@ -4,10 +4,15 @@ into one RGBA layer.
 The layer is re-rendered only when something visible changes (typing, hover,
 toggling); the render loop just blends the cached texture, so the UI costs
 nothing per frame beyond one textured quad.
+
+The look is Sakuga VFX's (github.com/finktheartist/sakuga-vfx, MIT): white cards with an
+inked edge and a hard lavender shadow, bold italic labels, violet when switched on. The
+click effects in fx.py use the same palette.
 """
 
 import calendar
 import datetime
+import functools
 import json
 import subprocess
 import uuid
@@ -19,10 +24,44 @@ NOTES_H = 230  # space above her head for the card
 HANDLE_R = 14  # resize arrow radius
 TOP_BAR = 38  # strip kept free at the top for the system monitor pill
 
-ACCENT = (64, 112, 230)
-INK = (32, 36, 52)
-MUTED = (150, 156, 172)
+CARD = (255, 255, 255)
+INK = (29, 26, 74)  # text and every inked edge
+SOFT = (184, 179, 255)  # the hard shadow under cards and buttons
+PRI = (143, 141, 247)  # fill of whatever is on or selected
+ACCENT = (90, 79, 216)  # accent text, and the outline of the effects
+PINK = (255, 95, 168)  # badges, the effects' wedges and needles
+MUTED = (133, 128, 176)
+TINT = (240, 239, 255)  # hovered rows and buttons
+TRACK = (201, 203, 224)
 ALERT = (226, 76, 76)  # due reminders
+
+
+@functools.lru_cache(maxsize=256)
+def box_sprite(w, h, radius, fill, edge, shadow, line=INK, shade=SOFT):
+    """A rounded box with an inked edge and a hard offset shadow, antialiased (drawn at 4x
+    and scaled down). Sizes in image pixels; the image is (w + shadow x, h + shadow y)."""
+    k = 4
+    sx, sy = shadow
+    img = Image.new("RGBA", ((w + sx) * k, (h + sy) * k), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    if sx or sy:
+        d.rounded_rectangle((sx * k, sy * k, (sx + w) * k - 1, (sy + h) * k - 1), radius * k, fill=shade)
+    if edge:
+        d.rounded_rectangle((0, 0, w * k - 1, h * k - 1), radius * k, fill=line)
+    e = round(edge * k)
+    d.rounded_rectangle((e, e, w * k - 1 - e, h * k - 1 - e), max(0, radius * k - e), fill=fill)
+    return img.resize((w + sx, h + sy), Image.LANCZOS)
+
+
+@functools.lru_cache(maxsize=64)
+def poly_sprite(points, fill):
+    """An antialiased polygon; points relative to its own top-left, in image pixels."""
+    k = 4
+    w = max(x for x, _ in points) + 1
+    h = max(y for _, y in points) + 1
+    img = Image.new("RGBA", (round(w * k), round(h * k)), (0, 0, 0, 0))
+    ImageDraw.Draw(img).polygon([(x * k, y * k) for x, y in points], fill=fill)
+    return img.resize((max(1, round(w)), max(1, round(h))), Image.LANCZOS)
 
 
 def find_font(pattern):
@@ -213,8 +252,9 @@ class Overlay:
         self.head_y = None  # top of her head in window coords, once measured
         self.origin = (0, 0)  # drawing origin (window coords) of the image being painted
         self.resize(model_w, model_h, left)
-        self.f_button = load_font("sans:bold", round(15 * px))
-        self.f_title = load_font("sans:bold", round(15 * px))
+        self.f_button = load_font("sans:bold:italic", round(15 * px))
+        self.f_mini = load_font("sans:bold:italic", round(11 * px))  # mini buttons
+        self.f_title = load_font("sans:bold:italic", round(15 * px))
         self.f_item = load_font("sans", round(15 * px))
         self.f_hint = load_font("sans", round(11 * px))
         self.f_day = load_font("sans", round(13 * px))
@@ -226,6 +266,10 @@ class Overlay:
         self.hover = None
         self.show_handles = False
         self.regions = []
+        self.squash = {}  # (kind, name) -> (x scale, y scale) of buttons being pressed (fx.Press)
+        self.flash = None  # (kind, name) of a button drawn inverted for an instant: the impact frame
+        self.caret = None  # (x, y) of the text caret in the open card, for typing effects
+        self._img = None  # the image being painted
 
     def resize(self, model_w, model_h, left=None):
         """left: width of the button column (PANEL_W), or 0 on portrait screens where the
@@ -250,6 +294,69 @@ class Overlay:
         ox, oy = self.origin
         return [round((v - (oy if i % 2 else ox)) * self.px) for i, v in enumerate(values)]
 
+    def rect_of(self, kind, index=None):
+        """Window rect of an element as last drawn, or None."""
+        for k, i, rect in self.regions:
+            if k == kind and i == index:
+                return rect
+        return None
+
+    def _pressed(self, kind, name, rect):
+        """rect squashed around its centre while its button springs back from a press."""
+        s = self.squash.get((kind, name))
+        if not s:
+            return rect
+        cx, cy = (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2
+        hw, hh = (rect[2] - rect[0]) / 2 * s[0], (rect[3] - rect[1]) / 2 * s[1]
+        return cx - hw, cy - hh, cx + hw, cy + hh
+
+    def _paste(self, sprite, x, y):
+        """Blend a sprite onto the image being painted, its top-left at image pixel (x, y)."""
+        cx, cy = max(0, -x), max(0, -y)  # cropped where it hangs off the top or left edge
+        if cx or cy:
+            if cx >= sprite.width or cy >= sprite.height:
+                return
+            sprite = sprite.crop((cx, cy, sprite.width, sprite.height))
+        self._img.alpha_composite(sprite, (x + cx, y + cy))
+
+    def _box(self, rect, fill=CARD, radius=12, edge=2.5, shadow=4):
+        """A Sakuga box at rect (window coords): inked edge, hard shadow down and right."""
+        x0, y0, x1, y1 = self.s(*rect)
+        if x1 <= x0 or y1 <= y0:
+            return
+        sh = (round(shadow * self.px), round(shadow * 7 / 6 * self.px))
+        self._paste(box_sprite(x1 - x0, y1 - y0, round(radius * self.px), tuple(fill[:3]), edge * self.px, sh),
+                    x0, y0)
+
+    def _circle(self, cx, cy, r, fill=CARD, edge=2.0, shadow=0):
+        self._box((cx - r, cy - r, cx + r, cy + r), fill, radius=r, edge=edge, shadow=shadow)
+
+    def _poly(self, points, fill):
+        """An antialiased polygon from window-coord x, y pairs."""
+        pts = self.s(*points)
+        xs, ys = pts[0::2], pts[1::2]
+        x0, y0 = min(xs), min(ys)
+        self._paste(poly_sprite(tuple((x - x0, y - y0) for x, y in zip(xs, ys)), (*fill[:3], 255)), x0, y0)
+
+    def _panel(self, rect, tail_x=None, tail=12):
+        """A white card with an inked edge; tail_x: a speech-bubble tail under it there."""
+        self._box(rect, radius=14, edge=2.5, shadow=5)
+        if tail_x is not None:
+            bottom = rect[3]
+            self._poly((tail_x - 12, bottom - 2.5, tail_x + 12, bottom - 2.5, tail_x, bottom + tail + 2), INK)
+            self._poly((tail_x - 8, bottom - 3, tail_x + 8, bottom - 3, tail_x, bottom + tail - 2.5), CARD)
+
+    def _checkbox(self, bx, by, size, done):
+        """A Sakuga checkbox: a white inked box, an ink tick when done."""
+        self._box((bx, by, bx + size, by + size), radius=4, edge=1.8, shadow=0)
+        if done:
+            k = size / 15
+            self._tick(bx + 3.5 * k, by + 8 * k, bx + 6.5 * k, by + 11 * k, bx + 12 * k, by + 4.5 * k)
+
+    def _tick(self, *pts):
+        ImageDraw.Draw(self._img).line(self.s(*pts), fill=(*INK, 255), width=max(1, round(2.4 * self.px)),
+                                       joint="curve")
+
     def hit(self, x, y):
         for kind, index, (x0, y0, x1, y1) in reversed(self.regions):
             if x0 <= x < x1 and y0 <= y < y1:
@@ -270,7 +377,9 @@ class Overlay:
         cal = cal or {"open": False}
         img = Image.new("RGBA", (round(self.w * self.px), round(self.h * self.px)), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
+        self._img = img
         self.regions = []
+        self.caret = None
         self._handles(d)  # first: buttons drawn later sit on top and win clicks where they overlap
 
         # Buttons beside her head, top aligned with it; slid up when the column would run
@@ -288,21 +397,20 @@ class Overlay:
             elif name == "pose" and active:
                 label = pose_label
             hovered = self.hover == ("button", name)
-            bg = (*ACCENT, 255) if active else (40, 50, 80, 255) if hovered else (24, 28, 44, 255)
-            d.rounded_rectangle(self.s(*rect), radius=round(12 * self.px), fill=bg)
-            d.text(self.s(rect[0] + 14, (rect[1] + rect[3]) / 2), label, font=self.f_button,
-                   fill=(255, 255, 255, 255), anchor="lm")
-            if name == "pendings" and pendings.open_count:
-                cx, cy = rect[2] - 16, (rect[1] + rect[3]) / 2
-                d.ellipse(self.s(cx - 10, cy - 10, cx + 10, cy + 10),
-                          fill=(255, 255, 255, 255) if active else (*ACCENT, 255))
-                d.text(self.s(cx, cy), str(pendings.open_count), font=self.f_hint, anchor="mm",
-                       fill=(*ACCENT, 255) if active else (255, 255, 255, 255))
+            fg = INK
+            if self.flash == ("button", name):  # the impact frame: inverted, no shadow
+                self._box(self._pressed("button", name, rect), INK, shadow=0)
+                fg = CARD
+            else:
+                self._box(self._pressed("button", name, rect), PRI if active else TINT if hovered else CARD)
+            d.text(self.s(rect[0] + 14, (rect[1] + rect[3]) / 2), label, font=self.f_button, fill=(*fg, 255),
+                   anchor="lm")
             due = cal.get("due_count", 0)
-            if name == "calendar" and due:  # red badge: reminders waiting to be marked done
+            badge = {"pendings": (pendings.open_count, PINK), "calendar": (due, ALERT)}.get(name)
+            if badge and badge[0]:  # count of open pendings / reminders waiting to be marked done
                 cx, cy = rect[2] - 16, (rect[1] + rect[3]) / 2
-                d.ellipse(self.s(cx - 10, cy - 10, cx + 10, cy + 10), fill=(*ALERT, 255))
-                d.text(self.s(cx, cy), str(due), font=self.f_hint, anchor="mm", fill=(255, 255, 255, 255))
+                self._circle(cx, cy, 10, badge[1], edge=1.8)
+                d.text(self.s(cx, cy), str(badge[0]), font=self.f_mini, anchor="mm", fill=(255, 255, 255, 255))
             self.regions.append(("button", name, rect))
             y += 48
 
@@ -349,7 +457,7 @@ class Overlay:
 
     def _calendar(self, d, cal):
         """Month grid to pick a date, a title field, Add/Update and the reminder list."""
-        white, dark = (255, 255, 255, 255), (24, 28, 44, 255)
+        ink = (*INK, 255)
         pad, cell_h, row_h = 12, 24, 22
         x0, x1 = self.left + 16, self.w - 16
         year, month = cal["month"]
@@ -363,24 +471,21 @@ class Overlay:
                 + max(1, len(shown_rows)) * row_h + (16 if len(listing) > len(shown_rows) else 0) + pad)
         top, bottom, tail = self._bubble_box(used)
         cx_tail = self.left + self.model_w / 2
-        d.rounded_rectangle(self.s(x0, top, x1, bottom), radius=round(14 * self.px), fill=white)
-        if tail:
-            d.polygon(self.s(cx_tail - 10, bottom - 1, cx_tail + 10, bottom - 1, cx_tail, bottom + 12), fill=white)
+        self._panel((x0, top, x1, bottom), cx_tail if tail else None)
         self.regions.append(("cal_card", None, (x0, top, x1, bottom + (12 if tail else 0))))
         self.card_top = top
 
         # Month header with prev/next arrows.
         y = top + pad
         d.text(self.s((x0 + x1) / 2, y + 13), datetime.date(year, month, 1).strftime("%B %Y"), font=self.f_title,
-               fill=(*ACCENT, 255), anchor="mm")
+               fill=ink, anchor="mm")
         for kind, ax in (("cal_prev", x0 + pad), ("cal_next", x1 - pad - 26)):
-            rect = (ax, y, ax + 26, y + 26)
-            if self.hover == (kind, None):
-                d.rounded_rectangle(self.s(*rect), radius=round(8 * self.px), fill=(228, 236, 253, 255))
-            mx, my = ax + 13, y + 13
+            rect = (ax, y, ax + 24, y + 24)
+            self._box(rect, TINT if self.hover == (kind, None) else CARD, radius=8, edge=2, shadow=2)
+            mx, my = ax + 12, y + 12
             tri = (mx + 3, my - 5, mx + 3, my + 5, mx - 4, my) if kind == "cal_prev" else \
                 (mx - 3, my - 5, mx - 3, my + 5, mx + 4, my)
-            d.polygon(self.s(*tri), fill=(*ACCENT, 255))
+            self._poly(tri, INK)
             self.regions.append((kind, None, rect))
         y += 26
 
@@ -395,17 +500,17 @@ class Overlay:
                 rect = (x0 + pad + i * cw + 2, y + 1, x0 + pad + (i + 1) * cw - 2, y + cell_h - 1)
                 selected, is_today = iso == cal["selected"], day == today
                 if selected:
-                    d.rounded_rectangle(self.s(*rect), radius=round(7 * self.px), fill=(*ACCENT, 255))
+                    self._box(rect, PRI, radius=7, edge=2, shadow=0)
                 elif self.hover == ("cal_day", iso):
-                    d.rounded_rectangle(self.s(*rect), radius=round(7 * self.px), fill=(228, 236, 253, 255))
-                color = white if selected else (*ACCENT, 255) if is_today else \
-                    (*INK, 255) if day.month == month else (*MUTED, 255)
+                    self._box(rect, TINT, radius=7, edge=0, shadow=0)
+                color = ink if selected else (*ACCENT, 255) if is_today else \
+                    ink if day.month == month else (*MUTED, 255)
                 font = self.f_day_bold if is_today else self.f_day
                 cx, cy = (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2
                 d.text(self.s(cx, cy - (2 if iso in marked else 0)), str(day.day), font=font, fill=color, anchor="mm")
                 if iso in marked:  # a reminder to do on this day; red once it is due
-                    dot = white if selected else (*ALERT, 255) if iso <= today.isoformat() else (*ACCENT, 255)
-                    d.ellipse(self.s(cx - 2, cy + 6, cx + 2, cy + 10), fill=dot)
+                    dot = INK if selected else ALERT if iso <= today.isoformat() else ACCENT
+                    self._circle(cx, cy + 8, 2.2, dot, edge=0)
                 self.regions.append(("cal_day", iso, rect))
             y += cell_h
         y += 8
@@ -413,9 +518,9 @@ class Overlay:
         # Selected date + title field.
         label = datetime.date.fromisoformat(cal["selected"]).strftime("%a %d %b")
         lw = self.f_title.getlength(label) / self.px
-        d.text(self.s(x0 + pad, y + 13), label, font=self.f_title, fill=(*INK, 255), anchor="lm")
+        d.text(self.s(x0 + pad, y + 13), label, font=self.f_title, fill=ink, anchor="lm")
         field = (x0 + pad + lw + 10, y, x1 - pad, y + 26)
-        d.rounded_rectangle(self.s(*field), radius=round(8 * self.px), fill=(238, 242, 252, 255))
+        self._box(field, radius=8, edge=2, shadow=2)
         limit = field[2] - field[0] - 20
         shown = cal["draft"]
         while shown and self.f_item.getlength(shown) > limit * self.px:
@@ -427,23 +532,24 @@ class Overlay:
             d.text(self.s(tx + 2, ty), self._fit("Reminder title", self.f_item, limit), font=self.f_item,
                    fill=(*MUTED, 255), anchor="lm")
         caret = tx + self.f_item.getlength(shown) / self.px + 1
-        d.line(self.s(caret, ty - 8, caret, ty + 8), fill=(*ACCENT, 255), width=max(1, round(2 * self.px)))
+        self.caret = (caret, ty)
+        d.line(self.s(caret, ty - 8, caret, ty + 8), fill=ink, width=max(1, round(2 * self.px)))
         self.regions.append(("cal_input", None, field))
         y += 30 + 6
 
         # Add / Update, and while editing: New, Delete.
         editing = cal["editing"]
         bx = x0 + pad
-        for kind, text, fill in (("cal_save", "Update" if editing else "Add reminder", ACCENT),
-                                 ("cal_new", "New", (40, 50, 80)) if editing else (None, None, None),
-                                 ("cal_delete", "Delete", ALERT) if editing else (None, None, None)):
+        for kind, text, fill, color in (("cal_save", "Update" if editing else "Add reminder", PRI, INK),
+                                        ("cal_new", "New", CARD, INK) if editing else (None,) * 4,
+                                        ("cal_delete", "Delete", CARD, ALERT) if editing else (None,) * 4):
             if not kind:
                 continue
-            w = self.f_hint.getlength(text) / self.px + 28
-            rect = (bx, y, bx + w, y + 28)
-            shade = tuple(min(255, c + 25) for c in fill) if self.hover == (kind, None) else fill
-            d.rounded_rectangle(self.s(*rect), radius=round(10 * self.px), fill=(*shade, 255))
-            d.text(self.s(bx + w / 2, y + 14), text, font=self.f_hint, fill=white, anchor="mm")
+            w = self.f_mini.getlength(text) / self.px + 28
+            rect = (bx, y, bx + w, y + 26)
+            self._box(self._pressed(kind, None, rect), TINT if self.hover == (kind, None) and fill == CARD else fill,
+                      radius=10, edge=2, shadow=2.5)
+            d.text(self.s(bx + w / 2, y + 13), text, font=self.f_mini, fill=(*color, 255), anchor="mm")
             self.regions.append((kind, None, rect))
             bx += w + 6
         # Yearly switch: a small track + knob, right-aligned on the same row.
@@ -451,10 +557,10 @@ class Overlay:
         label_w = self.f_hint.getlength("Yearly") / self.px
         track = (sw_x1 - 34, y + 6, sw_x1, y + 22)
         on = cal.get("yearly", False)
-        d.rounded_rectangle(self.s(*track), radius=round(8 * self.px), fill=(*ACCENT, 255) if on else (208, 218, 240, 255))
+        self._box(track, PRI if on else TRACK, radius=8, edge=2, shadow=0)
         kx = track[2] - 9 if on else track[0] + 9
-        d.ellipse(self.s(kx - 6, y + 8, kx + 6, y + 20), fill=white)
-        d.text(self.s(track[0] - 6, y + 14), "Yearly", font=self.f_hint, fill=(*INK, 255), anchor="rm")
+        self._circle(kx, y + 14, 6.5, CARD, edge=2)
+        d.text(self.s(track[0] - 6, y + 14), "Yearly", font=self.f_hint, fill=ink, anchor="rm")
         self.regions.append(("cal_yearly", None, (track[0] - label_w - 10, y, sw_x1, y + 28)))
         y += 28 + 10
 
@@ -471,18 +577,12 @@ class Overlay:
         for e in shown_rows:
             row = (x0 + 6, y, x1 - 6, y + row_h)
             if e["id"] == editing or self.hover == ("cal_event", e["id"]):
-                d.rounded_rectangle(self.s(*row), radius=round(6 * self.px), fill=(228, 236, 253, 255))
+                self._box(row, TINT, radius=6, edge=0, shadow=0)
             self.regions.append(("cal_event", e["id"], row))
             bx, by = x0 + pad, y + 4
             box = (bx - 2, by - 2, bx + 16, by + 16)
             finished = events.is_done(e)
-            if finished:
-                d.rounded_rectangle(self.s(bx, by, bx + 14, by + 14), radius=round(4 * self.px), fill=(*ACCENT, 255))
-                d.line(self.s(bx + 3, by + 7.5, bx + 6, by + 10.5, bx + 11, by + 4), fill=white,
-                       width=max(1, round(2 * self.px)))
-            else:
-                d.rounded_rectangle(self.s(bx, by, bx + 14, by + 14), radius=round(4 * self.px),
-                                    fill=(208, 218, 240, 255))
+            self._checkbox(bx, by, 14, finished)
             self.regions.append(("cal_done", e["id"], box))
             occ = events.when(e, today)
             due = not finished and occ <= today
@@ -492,12 +592,11 @@ class Overlay:
             title_x = bx + 22 + 88
             tag_w = (self.f_hint.getlength("yearly") / self.px + 12) if e["yearly"] else 0
             title = self._fit(e["title"], self.f_day, x1 - pad - title_x - tag_w)
-            color = (*MUTED, 255) if finished else (*INK, 255)
+            color = (*MUTED, 255) if finished else ink
             d.text(self.s(title_x, y + row_h / 2), title, font=self.f_day, fill=color, anchor="lm")
             if e["yearly"]:  # small tag at the end of the row
                 tx1 = x1 - pad
-                d.rounded_rectangle(self.s(tx1 - tag_w + 2, y + 4, tx1, y + row_h - 4), radius=round(6 * self.px),
-                                    fill=(228, 236, 253, 255))
+                self._box((tx1 - tag_w + 2, y + 3, tx1, y + row_h - 3), TINT, radius=7, edge=1.2, shadow=0)
                 d.text(self.s(tx1 - (tag_w - 2) / 2, y + row_h / 2), "yearly", font=self.f_hint,
                        fill=(*ACCENT, 255), anchor="mm")
             if finished:
@@ -510,19 +609,15 @@ class Overlay:
 
     def _alert(self, d, alerts):
         """The first waiting alert (reminder or system alarm) with its action button."""
-        white = (255, 255, 255, 255)
         a = alerts[0]
         pad = 12
         x0, x1 = self.left + 16, self.w - 16
-        action_w = self.f_hint.getlength(a["action"]) / self.px + 28
+        action_w = self.f_mini.getlength(a["action"]) / self.px + 28
         lines = self._wrap(a["title"], self.f_title, x1 - x0 - 2 * pad - action_w - 14)[:2]
         used = pad + 16 + len(lines) * 20 + (14 if len(alerts) > 1 else 0) + pad
         top, bottom, tail = self._bubble_box(used, above=self.card_top)
-        d.rounded_rectangle(self.s(x0, top, x1, bottom), radius=round(14 * self.px), fill=white)
-        d.rounded_rectangle(self.s(x0, top, x0 + 6, bottom), radius=round(3 * self.px), fill=(*ALERT, 255))
-        if tail:
-            cx = self.left + self.model_w / 2
-            d.polygon(self.s(cx - 10, bottom - 1, cx + 10, bottom - 1, cx, bottom + 12), fill=white)
+        self._panel((x0, top, x1, bottom), self.left + self.model_w / 2 if tail else None)
+        self._box((x0 + 6, top + 8, x0 + 10, bottom - 8), ALERT, radius=2, edge=0, shadow=0)
         self.regions.append(("alert", None, (x0, top, x1, bottom + (12 if tail else 0))))
         y = top + pad
         d.text(self.s(x0 + pad + 4, y + 6), a["label"], font=self.f_hint, fill=(*ALERT, 255), anchor="lm")
@@ -534,26 +629,25 @@ class Overlay:
             d.text(self.s(x0 + pad + 4, y + 6), f"+{len(alerts) - 1} more waiting", font=self.f_hint,
                    fill=(*MUTED, 255), anchor="lm")
         rect = (x1 - pad - action_w, (top + bottom) / 2 - 15, x1 - pad, (top + bottom) / 2 + 15)
-        fill = (*ACCENT, 255) if self.hover != ("alert_action", a["id"]) else (90, 135, 245, 255)
-        d.rounded_rectangle(self.s(*rect), radius=round(10 * self.px), fill=fill)
-        d.text(self.s((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2), a["action"], font=self.f_hint,
-               fill=white, anchor="mm")
+        self._box(rect, TINT if self.hover == ("alert_action", a["id"]) else PRI, radius=10, edge=2, shadow=2.5)
+        d.text(self.s((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2), a["action"], font=self.f_mini,
+               fill=(*INK, 255), anchor="mm")
         self.regions.append(("alert_action", a["id"], rect))
 
     def _voice(self, d, v):
         """Mic button (top-left) and a banner with what she heard / is doing / Run-Cancel."""
-        white, dark = (255, 255, 255, 255), (24, 28, 44, 255)
+        ink = (*INK, 255)
         state = v["state"]
         cx, cy, r = 25, 20, 13
-        fill = {"listening": ALERT, "thinking": (230, 160, 40), "confirm": ACCENT}.get(state)
+        fill = {"listening": PINK, "thinking": (255, 200, 90), "confirm": PRI}.get(state)
         if fill is None:
-            fill = (40, 50, 80) if self.hover == ("mic", None) else dark[:3]
-        d.ellipse(self.s(cx - r, cy - r, cx + r, cy + r), fill=(*fill, 255))
+            fill = TINT if self.hover == ("mic", None) else CARD
+        self._circle(cx, cy, r, fill, shadow=2)
         lw = max(1, round(2 * self.px))
-        d.rounded_rectangle(self.s(cx - 3.5, cy - 8, cx + 3.5, cy + 2), radius=round(3.5 * self.px), fill=white)
-        d.arc(self.s(cx - 7, cy - 6, cx + 7, cy + 5), start=0, end=180, fill=white, width=lw)
-        d.line(self.s(cx, cy + 5, cx, cy + 8), fill=white, width=lw)
-        d.line(self.s(cx - 4, cy + 8.5, cx + 4, cy + 8.5), fill=white, width=lw)
+        self._box((cx - 3.5, cy - 8, cx + 3.5, cy + 2), INK, radius=3.5, edge=0, shadow=0)
+        d.arc(self.s(cx - 7, cy - 6, cx + 7, cy + 5), start=0, end=180, fill=ink, width=lw)
+        d.line(self.s(cx, cy + 5, cx, cy + 8), fill=ink, width=lw)
+        d.line(self.s(cx - 4, cy + 8.5, cx + 4, cy + 8.5), fill=ink, width=lw)
         self.regions.append(("mic", None, (cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2)))
 
         text = v.get("text")
@@ -563,29 +657,28 @@ class Overlay:
         confirm = state == "confirm" and v.get("command")
         h = 30 + (52 if confirm else 0)
         top = TOP_BAR + 2
-        d.rounded_rectangle(self.s(x0, top, x1, top + h), radius=round(12 * self.px), fill=dark)
+        self._box((x0, top, x1, top + h), radius=12, edge=2.5, shadow=4)
         self.regions.append(("voice_banner", None, (x0, top, x1, top + h)))
-        color = (*ALERT, 255) if v.get("error") else white
+        color = (*ALERT, 255) if v.get("error") else ink
         d.text(self.s(x0 + pad, top + 15), self._fit(text, self.f_hint, x1 - x0 - 2 * pad), font=self.f_hint,
                fill=color, anchor="lm")
         if not confirm:
             return
         y = top + 30
-        d.rounded_rectangle(self.s(x0 + pad, y, x1 - pad, y + 20), radius=round(6 * self.px), fill=(40, 48, 72, 255))
+        self._box((x0 + pad, y, x1 - pad, y + 20), INK, radius=6, edge=0, shadow=0)
         d.text(self.s(x0 + pad + 8, y + 10), self._fit("$ " + v["command"], self.f_hint, x1 - x0 - 2 * pad - 16),
-               font=self.f_hint, fill=(170, 210, 255, 255), anchor="lm")
+               font=self.f_hint, fill=(*SOFT, 255), anchor="lm")
         y += 24
         bx = x1 - pad
-        for kind, label, base in (("voice_cancel", "Cancel", (60, 70, 100)), ("voice_run", "Run", ACCENT)):
-            w = self.f_hint.getlength(label) / self.px + 26
+        for kind, label, base in (("voice_cancel", "Cancel", CARD), ("voice_run", "Run", PRI)):
+            w = self.f_mini.getlength(label) / self.px + 26
             rect = (bx - w, y, bx, y + 22)
-            shade = tuple(min(255, c + 25) for c in base) if self.hover == (kind, None) else base
-            d.rounded_rectangle(self.s(*rect), radius=round(8 * self.px), fill=(*shade, 255))
-            d.text(self.s(rect[0] + w / 2, y + 11), label, font=self.f_hint, fill=white, anchor="mm")
+            self._box(rect, TINT if self.hover == (kind, None) else base, radius=8, edge=2, shadow=2)
+            d.text(self.s(rect[0] + w / 2, y + 11), label, font=self.f_mini, fill=ink, anchor="mm")
             self.regions.append((kind, None, rect))
             bx -= w + 6
         d.text(self.s(x0 + pad, y + 11), "Run once to approve: it is then remembered", font=self.f_hint,
-               fill=(150, 160, 190, 255), anchor="lm")
+               fill=(*MUTED, 255), anchor="lm")
 
     def monitor_rects(self, mon):
         """Pill and (when open) panel rectangles. Fixed sizes, so changing numbers never
@@ -602,48 +695,48 @@ class Overlay:
     def render_monitor(self, mon):
         """Paint just the monitor into a small image: (premultiplied bytes, (x, y, w, h))."""
         pill, panel = self.monitor_rects(mon)
-        box = (min(pill[0], panel[0]) if panel else pill[0], pill[1], pill[2], panel[3] if panel else pill[3])
-        w, h = round((box[2] - box[0]) * self.px), round((box[3] - box[1]) * self.px)
+        box = (min(pill[0], panel[0]) if panel else pill[0], pill[1], pill[2] + 4, (panel[3] if panel else pill[3]) + 5)
+        w, h = round((box[2] - box[0]) * self.px), round((box[3] - box[1]) * self.px)  # with the shadows
         img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        regions, self.origin = self.regions, (box[0], box[1])
+        regions, self.origin, main = self.regions, (box[0], box[1]), self._img
+        self._img = img
         try:
             self._monitor(ImageDraw.Draw(img), mon)
         finally:
-            self.regions, self.origin = regions, (0, 0)
+            self.regions, self.origin, self._img = regions, (0, 0), main
         return img.convert("RGBa").tobytes(), (box[0], box[1], w, h)
 
     def _monitor(self, d, mon):
         """Top-right system pill (CPU/GPU/RAM + status dot); click for the detail panel."""
-        white, dark = (255, 255, 255, 255), (24, 28, 44, 255)
-        level_color = {"ok": (80, 200, 120), "warn": (240, 180, 60), "alarm": ALERT}
+        ink = (*INK, 255)
+        level_color = {"ok": (60, 180, 100), "warn": (215, 145, 20), "alarm": ALERT}  # readable on white
         chips = "   ".join(f"{k} {v}" for k, v in mon["pill"])
         rect, panel = self.monitor_rects(mon)
         y0 = rect[1]
-        d.rounded_rectangle(self.s(*rect), radius=round(12 * self.px),
-                            fill=(40, 50, 80, 255) if self.hover == ("monitor_toggle", None) else dark)
-        d.ellipse(self.s(rect[0] + 10, y0 + 8, rect[0] + 18, y0 + 16), fill=(*level_color[mon["level"]], 255))
-        d.text(self.s(rect[0] + 26, y0 + 12), chips, font=self.f_hint, fill=white, anchor="lm")
+        self._box(rect, TINT if self.hover == ("monitor_toggle", None) else CARD, radius=12, edge=2, shadow=2.5)
+        self._circle(rect[0] + 14, y0 + 12, 4.5, level_color[mon["level"]], edge=1.5)
+        d.text(self.s(rect[0] + 26, y0 + 12), chips, font=self.f_hint, fill=ink, anchor="lm")
         if not panel:
             return
         rows = mon["rows"]
-        d.rounded_rectangle(self.s(*panel), radius=round(12 * self.px), fill=dark)
+        self._box(panel, radius=12, edge=2.5, shadow=4)
         y = panel[1] + 10
         bx0, bx1 = panel[0] + 12, panel[2] - 12
         for label, value, frac, level in rows:
-            d.text(self.s(bx0, y + 7), label, font=self.f_hint, fill=(170, 180, 205, 255), anchor="lm")
+            d.text(self.s(bx0, y + 7), label, font=self.f_hint, fill=(*MUTED, 255), anchor="lm")
             d.text(self.s(bx1, y + 7), value, font=self.f_hint, fill=(*level_color[level], 255) if level != "ok"
-                   else white, anchor="rm")
+                   else ink, anchor="rm")
             if frac is not None:  # usage bar
-                d.rounded_rectangle(self.s(bx0, y + 16, bx1, y + 19), radius=round(2 * self.px), fill=(50, 58, 85, 255))
+                self._box((bx0, y + 15, bx1, y + 20), TRACK, radius=2.5, edge=0, shadow=0)
                 fx = bx0 + (bx1 - bx0) * max(0.0, min(1.0, frac))
-                if fx > bx0 + 1:
-                    d.rounded_rectangle(self.s(bx0, y + 16, fx, y + 19), radius=round(2 * self.px),
-                                        fill=(*level_color[level], 255) if level != "ok" else (*ACCENT, 255))
+                if fx > bx0 + 5:
+                    self._box((bx0, y + 15, fx, y + 20), level_color[level] if level != "ok" else PRI,
+                              radius=2.5, edge=0, shadow=0)
             y += 24
         if mon.get("top"):
-            d.text(self.s(bx0, y + 6), "TOP PROCESS", font=self.f_hint, fill=(170, 180, 205, 255), anchor="lm")
+            d.text(self.s(bx0, y + 6), "TOP PROCESS", font=self.f_hint, fill=(*MUTED, 255), anchor="lm")
             d.text(self.s(bx0, y + 20), self._fit(mon["top"], self.f_hint, bx1 - bx0), font=self.f_hint,
-                   fill=white, anchor="lm")
+                   fill=ink, anchor="lm")
 
     def _column_height(self, active, opened):
         """Height of the whole left column (big buttons, actions, moves) as drawn below."""
@@ -663,10 +756,10 @@ class Overlay:
             bx = x0 + (i % 2) * (col_w + 4)
             rect = (bx, y, bx + col_w, y + row_h)
             hovered = self.hover == ("action", name)
-            bg = (*ACCENT, 255) if on.get(name) else (40, 50, 80, 255) if hovered else (24, 28, 44, 255)
-            d.rounded_rectangle(self.s(*rect), radius=round(10 * self.px), fill=bg)
-            d.text(self.s((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2), label, font=self.f_hint,
-                   fill=(255, 255, 255, 255), anchor="mm")
+            self._box(self._pressed("action", name, rect), PRI if on.get(name) else TINT if hovered else CARD,
+                      radius=10, edge=2, shadow=2.5)
+            d.text(self.s((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2), label, font=self.f_mini,
+                   fill=(*INK, 255), anchor="mm")
             self.regions.append(("action", name, rect))
             if i % 2 or i == len(self.actions) - 1:
                 y += row_h + 6
@@ -675,29 +768,28 @@ class Overlay:
     def _moves(self, d, y, active, opened):
         """Mini buttons for every expression, in two columns under the big buttons.
         A 'Moves' header collapses them (they can cover her arm on narrow screens)."""
-        white, dark = (255, 255, 255, 255), (24, 28, 44, 255)
+        ink = (*INK, 255)
         x0, x1 = 12, PANEL_W - 12
         col_w, row_h, gap = (x1 - x0 - 4) / 2, 24, 4
 
         header = (x0, y, x1, y + 22)
-        hovered = self.hover == ("moves_toggle", None)
-        d.rounded_rectangle(self.s(*header), radius=round(11 * self.px), fill=(40, 50, 80, 255) if hovered else dark)
-        d.text(self.s(x0 + 12, y + 11), f"Moves ({len(active)} on)" if active else "Moves", font=self.f_hint,
-               fill=white, anchor="lm")
+        self._box(header, TINT if self.hover == ("moves_toggle", None) else CARD, radius=11, edge=2, shadow=2)
+        d.text(self.s(x0 + 12, y + 11), f"Moves ({len(active)} on)" if active else "Moves", font=self.f_mini,
+               fill=ink, anchor="lm")
         cx, cy = x1 - 14, y + 11  # open/closed chevron, drawn (fonts may lack the glyph)
         tri = (cx - 4, cy - 2, cx + 4, cy - 2, cx, cy + 3) if opened else (cx - 2, cy - 4, cx - 2, cy + 4, cx + 3, cy)
-        d.polygon(self.s(*tri), fill=white)
+        self._poly(tri, INK)
         self.regions.append(("moves_toggle", None, header))
         if not opened:
             return
         y += 22 + gap
 
         for group in self.moves:
-            # Group name on its own small dark tag, so it reads on any wallpaper.
+            # Group name on its own small ink tag, so it reads on any wallpaper.
             name = group["name"].upper()
-            tw = self.f_hint.getlength(name) / self.px
-            d.rounded_rectangle(self.s(x0, y, x0 + tw + 14, y + 15), radius=round(7 * self.px), fill=dark)
-            d.text(self.s(x0 + 7, y + 7.5), name, font=self.f_hint, fill=(150, 175, 245, 255), anchor="lm")
+            tw = self.f_mini.getlength(name) / self.px
+            self._box((x0, y, x0 + tw + 14, y + 15), INK, radius=7, edge=0, shadow=0)
+            d.text(self.s(x0 + 7, y + 7.5), name, font=self.f_mini, fill=(*SOFT, 255), anchor="lm")
             self.regions.append(("tag", None, (x0, y, x0 + tw + 14, y + 15)))
             y += 18
             for i, (exp, label) in enumerate(group["moves"]):
@@ -705,10 +797,10 @@ class Overlay:
                 rect = (bx, y, bx + col_w, y + row_h)
                 on = exp in active
                 hovered = self.hover == ("move", exp)
-                bg = (*ACCENT, 255) if on else (40, 50, 80, 255) if hovered else dark
-                d.rounded_rectangle(self.s(*rect), radius=round(8 * self.px), fill=bg)
-                d.text(self.s((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2), label, font=self.f_hint,
-                       fill=white, anchor="mm")
+                self._box(self._pressed("move", exp, rect), PRI if on else TINT if hovered else CARD,
+                          radius=8, edge=2, shadow=2)
+                d.text(self.s((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2), label, font=self.f_mini,
+                       fill=ink, anchor="mm")
                 self.regions.append(("move", exp, rect))
                 if i % 2 or i == len(group["moves"]) - 1:
                     y += row_h + gap
@@ -716,36 +808,35 @@ class Overlay:
 
         if active:  # one click to undo them all
             rect = (x0, y, x1, y + row_h)
-            hovered = self.hover == ("move", None)
-            d.rounded_rectangle(self.s(*rect), radius=round(8 * self.px), fill=(40, 50, 80, 255) if hovered else dark)
-            d.text(self.s((x0 + x1) / 2, y + row_h / 2), "Clear all", font=self.f_hint, fill=white, anchor="mm")
+            self._box(rect, TINT if self.hover == ("move", None) else CARD, radius=8, edge=2, shadow=2)
+            d.text(self.s((x0 + x1) / 2, y + row_h / 2), "Clear all", font=self.f_mini, fill=ink, anchor="mm")
             self.regions.append(("move", None, rect))
 
     def _handles(self, d):
-        white = (255, 255, 255, 255)
+        ink = (*INK, 255)
         lw = max(1, round(2 * self.px))
         for name, (x0, y0, x1, y1) in self.handle_rects().items():
             self.regions.append(("handle", name, (x0, y0, x1, y1)))
             if not self.show_handles:
                 continue  # still clickable, just not drawn until the pointer is over her
             hovered = self.hover == ("handle", name)
-            d.ellipse(self.s(x0, y0, x1, y1), fill=(*ACCENT, 255) if hovered else (24, 28, 44, 255))
             cx, cy, a = (x0 + x1) / 2, (y0 + y1) / 2, HANDLE_R - 6
+            self._circle(cx, cy, HANDLE_R, PRI if hovered else CARD, shadow=2)
             if name in ("left", "right"):  # double-headed horizontal arrow
-                d.line(self.s(cx - a, cy, cx + a, cy), fill=white, width=lw)
-                d.line(self.s(cx - a + 4, cy - 4, cx - a, cy, cx - a + 4, cy + 4), fill=white, width=lw)
-                d.line(self.s(cx + a - 4, cy - 4, cx + a, cy, cx + a - 4, cy + 4), fill=white, width=lw)
+                d.line(self.s(cx - a, cy, cx + a, cy), fill=ink, width=lw)
+                d.line(self.s(cx - a + 4, cy - 4, cx - a, cy, cx - a + 4, cy + 4), fill=ink, width=lw)
+                d.line(self.s(cx + a - 4, cy - 4, cx + a, cy, cx + a - 4, cy + 4), fill=ink, width=lw)
             else:  # double-headed vertical arrow
-                d.line(self.s(cx, cy - a, cx, cy + a), fill=white, width=lw)
-                d.line(self.s(cx - 4, cy - a + 4, cx, cy - a, cx + 4, cy - a + 4), fill=white, width=lw)
-                d.line(self.s(cx - 4, cy + a - 4, cx, cy + a, cx + 4, cy + a - 4), fill=white, width=lw)
+                d.line(self.s(cx, cy - a, cx, cy + a), fill=ink, width=lw)
+                d.line(self.s(cx - 4, cy - a + 4, cx, cy - a, cx + 4, cy - a + 4), fill=ink, width=lw)
+                d.line(self.s(cx - 4, cy + a - 4, cx, cy + a, cx + 4, cy + a - 4), fill=ink, width=lw)
 
     def _footer(self, d, text):
         tw = self.f_hint.getlength(text) / self.px
         x0, y1 = 12, self.h - 8  # bottom of the button column, clear of the bottom arrow
         rect = (x0, y1 - 22, x0 + tw + 24, y1)
-        d.rounded_rectangle(self.s(*rect), radius=round(11 * self.px), fill=(24, 28, 44, 255))
-        d.text(self.s(x0 + 12, y1 - 11), text, font=self.f_hint, fill=(225, 230, 245, 255), anchor="lm")
+        self._box(rect, radius=11, edge=2, shadow=2)
+        d.text(self.s(x0 + 12, y1 - 11), text, font=self.f_hint, fill=(*INK, 255), anchor="lm")
         self.regions.append(("footer", None, rect))
 
     def _wrap(self, text, font, width):
@@ -795,8 +886,7 @@ class Overlay:
         top = bottom - used
         self.card_top = top
         cx = self.left + self.model_w / 2
-        d.rounded_rectangle(self.s(x0, top, x1, bottom), radius=round(14 * self.px), fill=(255, 255, 255, 255))
-        d.polygon(self.s(cx - 10, bottom - 1, cx + 10, bottom - 1, cx, bottom + tail), fill=(255, 255, 255, 255))
+        self._panel((x0, top, x1, bottom), cx, tail)
         self.regions.append(("card", None, (x0, top, x1, bottom + tail)))
 
         y = top + pad
@@ -808,19 +898,9 @@ class Overlay:
         y += title_h
 
         for index, item, lines, h in rows:
-            hovered = self.hover == ("item", index)
-            if hovered:
-                # ImageDraw replaces pixels rather than blending, so use an opaque tint.
-                d.rounded_rectangle(self.s(x0 + 6, y - 2, x1 - 6, y + h - 2), radius=round(6 * self.px),
-                                    fill=(228, 236, 253, 255))
-            bx, by = x0 + pad, y + 2
-            if item["done"]:
-                d.rounded_rectangle(self.s(bx, by, bx + 15, by + 15), radius=round(4 * self.px), fill=(*ACCENT, 255))
-                d.line(self.s(bx + 3.5, by + 8, bx + 6.5, by + 11, bx + 12, by + 4.5), fill=(255, 255, 255, 255),
-                       width=max(1, round(2 * self.px)))
-            else:
-                d.rounded_rectangle(self.s(bx, by, bx + 15, by + 15), radius=round(4 * self.px),
-                                    fill=(208, 218, 240, 255))
+            if self.hover == ("item", index):
+                self._box((x0 + 6, y - 2, x1 - 6, y + h - 2), TINT, radius=6, edge=0, shadow=0)
+            self._checkbox(x0 + pad, y + 2, 15, item["done"])
             color = (*MUTED, 255) if item["done"] else (*INK, 255)
             for n, ln in enumerate(lines):
                 ty = y + n * line_h
@@ -838,8 +918,7 @@ class Overlay:
 
         # Input row: the text being typed, clipped from the left so the caret stays visible.
         iy = bottom - pad - input_h + 4
-        d.rounded_rectangle(self.s(x0 + pad, iy, x1 - pad, iy + input_h - 4), radius=round(8 * self.px),
-                            fill=(238, 242, 252, 255))
+        self._box((x0 + pad, iy, x1 - pad, iy + input_h - 4), radius=8, edge=2, shadow=2)
         shown = draft
         limit = (x1 - pad - 14 - (x0 + pad + 10)) * self.px
         while shown and self.f_item.getlength(shown) > limit:
@@ -855,4 +934,5 @@ class Overlay:
                     break
             d.text(self.s(tx + 4, ty), hint, font=self.f_item, fill=(*MUTED, 255), anchor="lm")
         caret = tx + self.f_item.getlength(shown) / self.px + 1
-        d.line(self.s(caret, ty - 9, caret, ty + 9), fill=(*ACCENT, 255), width=max(1, round(2 * self.px)))
+        self.caret = (caret, ty)
+        d.line(self.s(caret, ty - 9, caret, ty + 9), fill=(*INK, 255), width=max(1, round(2 * self.px)))
