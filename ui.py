@@ -16,6 +16,7 @@ import functools
 import json
 import subprocess
 import uuid
+from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -23,6 +24,7 @@ PANEL_W = 150  # left button column
 NOTES_H = 230  # space above her head for the card
 HANDLE_R = 14  # resize arrow radius
 TOP_BAR = 38  # strip kept free at the top for the system monitor pill
+BUTTON_H, BUTTON_STEP = 32, 40  # the big side buttons: height, and from one to the next
 
 CARD = (255, 255, 255)
 INK = (29, 26, 74)  # text and every inked edge
@@ -34,6 +36,19 @@ MUTED = (133, 128, 176)
 TINT = (240, 239, 255)  # hovered rows and buttons
 TRACK = (201, 203, 224)
 ALERT = (226, 76, 76)  # due reminders
+
+
+def ago(iso):
+    """'5m ago' for an ISO 8601 UTC time (as GitHub gives them)."""
+    try:
+        then = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return ""
+    s = max(0, (datetime.datetime.now(datetime.timezone.utc) - then).total_seconds())
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= size:
+            return f"{int(s // size)}{unit} ago"
+    return "just now"
 
 
 @functools.lru_cache(maxsize=256)
@@ -259,10 +274,13 @@ class Overlay:
         self.f_hint = load_font("sans", round(11 * px))
         self.f_day = load_font("sans", round(13 * px))
         self.f_day_bold = load_font("sans:bold", round(13 * px))
+        self.f_mono = load_font("monospace", round(12 * px))  # decoded output
         self.buttons = [("pendings", "Pendings"), ("calendar", "Calendar"), ("talk", "Talk"), ("dance", "Dance"),
-                        ("pose", "Pose")]
+                        ("pose", "Pose"), ("think", "Think")]
         self.moves = []  # [{"name": group, "moves": [[expression, label], ...]}, ...]
-        self.actions = [("walk", "Walk"), ("greet", "Greet")]  # animated, not toggled expressions
+        # Mini buttons under the big ones: animations, and the tools' cards.
+        self.actions = [("walk", "Walk"), ("greet", "Greet"), ("huh", "Huh?"), ("decode", "Decode"),
+                        ("review", "PR Review"), ("settings", "Settings")]
         self.hover = None
         self.show_handles = False
         self.regions = []
@@ -270,6 +288,9 @@ class Overlay:
         self.flash = None  # (kind, name) of a button drawn inverted for an instant: the impact frame
         self.caret = None  # (x, y) of the text caret in the open card, for typing effects
         self._img = None  # the image being painted
+        self.pr_rows = 0  # rows in the pull-request card, as last drawn
+        self.dec_rows = 0  # result rows in the Decode card, as last drawn
+        self.pk_rows = 0  # rows in the PR review picker, as last drawn
 
     def resize(self, model_w, model_h, left=None):
         """left: width of the button column (PANEL_W), or 0 on portrait screens where the
@@ -364,7 +385,8 @@ class Overlay:
         return None
 
     def render(self, pendings, pendings_open, draft, talk_left=None, active_moves=(), moves_open=True,
-               dancing=False, pose_label=None, actions_on=None, cal=None, alerts=(), monitor=None, voice=None):
+               dancing=False, pose_label=None, actions_on=None, cal=None, alerts=(), monitor=None, voice=None,
+               thinking=False, prs=None, gh_badge=None, dec=None, picker=None, settings=None):
         """Return the layer as premultiplied RGBA bytes, rows top to bottom.
 
         talk_left: whole seconds of talking left, or None when she is quiet.
@@ -373,6 +395,15 @@ class Overlay:
         alerts: bubbles to show above her head [{id, label, title, action}], first one shown.
         monitor: system monitor state for the top-right pill, or None.
         voice: {state, text, error, command} for the mic button and its banner, or None.
+        thinking: the Think pose is on.
+        prs: {open, items, checked, skip} for the pull-request comments card (skip: rows scrolled
+        past), or None.
+        dec: the Decode card {open, draft, result, status, explanation, clipboard, skip}, or None.
+        picker: the PR review picker {open, step, path, entries, repo, branches, base, filter,
+        selected, skip, status}, or None.
+        settings: the Settings card {open, monitors, choice, largest, here, available}, or None.
+        gh_badge: a function giving (x, y) of the floating GitHub badge (drawn by the effects), to
+        make it clickable; called once the cards are laid out, since it moves out of their way.
         """
         cal = cal or {"open": False}
         img = Image.new("RGBA", (round(self.w * self.px), round(self.h * self.px)), (0, 0, 0, 0))
@@ -385,17 +416,19 @@ class Overlay:
         # Buttons beside her head, top aligned with it; slid up when the column would run
         # into the footer (the space above her head on that side is free).
         head = self.head_y if self.head_y is not None else NOTES_H + 16
-        y = max(8, min(head, self.h - 38 - self._column_height(active_moves, moves_open)))
+        y = max(TOP_BAR + 2, min(head, self.h - 38 - self._column_height(active_moves, moves_open)))  # clear of the mic
         for name, label in self.buttons:
-            rect = (12, y, PANEL_W - 12, y + 38)
+            rect = (12, y, PANEL_W - 12, y + BUTTON_H)
             active = {"pendings": pendings_open, "calendar": cal["open"], "talk": talk_left is not None,
-                      "dance": dancing, "pose": pose_label is not None}[name]
+                      "dance": dancing, "pose": pose_label is not None, "think": thinking}[name]
             if name == "talk" and active:
                 label = f"Talking · {talk_left}s"
             elif name == "dance" and active:
                 label = "Dancing · stop"
             elif name == "pose" and active:
                 label = pose_label
+            elif name == "think" and active:
+                label = "Hmm… · got it"
             hovered = self.hover == ("button", name)
             fg = INK
             if self.flash == ("button", name):  # the impact frame: inverted, no shadow
@@ -412,9 +445,11 @@ class Overlay:
                 self._circle(cx, cy, 10, badge[1], edge=1.8)
                 d.text(self.s(cx, cy), str(badge[0]), font=self.f_mini, anchor="mm", fill=(255, 255, 255, 255))
             self.regions.append(("button", name, rect))
-            y += 48
+            y += BUTTON_STEP
 
-        y = self._actions(d, y, actions_on or {})
+        on = dict(actions_on or {}, decode=bool(dec and dec["open"]), review=bool(picker and picker["open"]),
+                  settings=bool(settings and settings["open"]))
+        y = self._actions(d, y, on)
         if self.moves:
             self._moves(d, y, active_moves, moves_open)
         if monitor:  # click areas only (painted separately by render_monitor); before the cards
@@ -422,16 +457,31 @@ class Overlay:
             self.regions.append(("monitor_toggle", None, pill))
             if panel:
                 self.regions.append(("monitor_panel", None, panel))
-        self.card_top = None
+        self.card_top = self.card_bottom = None
+        prs_open = bool(prs and prs["open"])
         if pendings_open:  # after the arrows, so the card covers (and wins clicks over) the top one
             self._card(d, pendings, draft)
         elif cal["open"]:
             self._calendar(d, cal)
+        elif prs_open:
+            self._prs(d, prs)
+        elif dec and dec["open"]:
+            self._decoder(d, dec)
+        elif picker and picker["open"]:
+            self._picker(d, picker)
+        elif settings and settings["open"]:
+            self._settings(d, settings)
         if alerts and not cal["open"]:  # the calendar lists them itself
             self._alert(d, alerts)
+        if gh_badge:  # over the cards: the badge floats on top of everything
+            x, y = gh_badge()
+            self.regions.append(("gh_badge", None, (x - 27, y - 32, x + 27, y + 30)))
         if voice:  # last: its Run/Cancel must never be covered
             self._voice(d, voice)
-        self._footer(d, "Esc  ·  close" + (" the list" if pendings_open else " the calendar" if cal["open"] else ""))
+        self._footer(d, "Esc  ·  close" + (" the list" if pendings_open else " the calendar" if cal["open"]
+                                           else " the comments" if prs_open else " Decode" if dec and dec["open"]
+                                           else " PR review" if picker and picker["open"]
+                                           else " Settings" if settings and settings["open"] else ""))
         return img.convert("RGBa").tobytes()
 
     def _fit(self, text, font, width):
@@ -473,7 +523,7 @@ class Overlay:
         cx_tail = self.left + self.model_w / 2
         self._panel((x0, top, x1, bottom), cx_tail if tail else None)
         self.regions.append(("cal_card", None, (x0, top, x1, bottom + (12 if tail else 0))))
-        self.card_top = top
+        self.card_top, self.card_bottom = top, bottom
 
         # Month header with prev/next arrows.
         y = top + pad
@@ -634,6 +684,367 @@ class Overlay:
                fill=(*INK, 255), anchor="mm")
         self.regions.append(("alert_action", a["id"], rect))
 
+    def _prs(self, d, pr):
+        """The new comments on your pull requests, grouped by PR (latest activity first), to
+        read and see which repo they are in. Read only: nothing here writes to GitHub."""
+        ink, muted = (*INK, 255), (*MUTED, 255)
+        pad, x0, x1 = 12, self.left + 16, self.w - 16
+        width = x1 - x0 - 2 * pad
+        groups = {}
+        for c in reversed(pr["items"]):  # newest first, so each PR sits where its latest comment is
+            groups.setdefault((c["repo"], c["number"]), []).append(c)
+
+        rows = []  # (kind, height, data)
+        for (repo, number), comments in groups.items():
+            heading = ("pr", 22, (repo, number, comments[0]["title"]))
+            rows.append(heading)
+            for c in comments:
+                body = " ".join(c["body"].replace("```", " ").split())
+                if not body and c["kind"] == "review":
+                    body = {"APPROVED": "Approved", "CHANGES_REQUESTED": "Requested changes"}.get(c.get("state"), "")
+                lines = self._wrap(body, self.f_hint, width - 10)[:3] if body else []
+                if len(lines) == 3:
+                    lines[2] = self._fit(lines[2] + " …", self.f_hint, width - 10)
+                rows.append(("comment", 18 + 15 * len(lines) + 6, (c, lines), heading))
+
+        max_h = self.h - TOP_BAR - 50  # reading them is worth covering her for a moment
+        title_h = 30
+        skip = max(0, min(pr.get("skip", 0), len(rows) - 1))
+        self.pr_rows = len(rows)  # for scrolling
+        used, shown = pad + title_h + pad + (18 if skip else 0), []
+        if rows and rows[skip][0] == "comment":  # scrolled into a PR: keep its heading on top
+            shown.append(rows[skip][3])
+            used += rows[skip][3][1]
+        for i, row in enumerate(rows[skip:], skip):
+            more = 18 if i < len(rows) - 1 else 0
+            if used + row[1] + more > max_h:
+                break
+            shown.append(row)
+            used += row[1]
+        above = sum(1 for r in rows[:skip] if r[0] == "comment")
+        hidden = sum(1 for r in rows[skip + len(shown):] if r[0] == "comment")
+        if hidden:
+            used += 18
+        top, bottom, tail = self._bubble_box(used)
+        self._panel((x0, top, x1, bottom), self.left + self.model_w / 2 if tail else None)
+        self.regions.append(("pr_card", None, (x0, top, x1, bottom + (12 if tail else 0))))
+        self.card_top, self.card_bottom = top, bottom
+
+        y = top + pad
+        n = len(pr["items"])
+        d.text(self.s(x0 + pad, y + 10), f"Pull requests · {n} new comment{'s' * (n != 1)}", font=self.f_title,
+               fill=(*ACCENT, 255), anchor="lm")
+        if pr.get("checked"):
+            d.text(self.s(x1 - pad, y + 10), f"checked {pr['checked']}", font=self.f_hint, fill=muted, anchor="rm")
+        y += title_h
+        if above:
+            d.text(self.s(x0 + pad, y + 9), f"{above} more above · scroll up", font=self.f_hint, fill=muted, anchor="lm")
+            y += 18
+        for kind, h, data, *_ in shown:
+            if kind == "pr":  # which repo and PR: the place to go and check
+                repo, number, title = data
+                self._box((x0 + 6, y, x1 - 6, y + 18), TINT, radius=6, edge=0, shadow=0)
+                label = f"{repo} #{number}"
+                d.text(self.s(x0 + pad, y + 9), label, font=self.f_day_bold, fill=ink, anchor="lm")
+                lw = self.f_day_bold.getlength(label) / self.px
+                d.text(self.s(x0 + pad + lw + 8, y + 9), self._fit(title, self.f_hint, width - lw - 10),
+                       font=self.f_hint, fill=muted, anchor="lm")
+            else:
+                c, lines = data
+                what = {"review": "review", "inline": f"on {c.get('path', '').split('/')[-1]}"
+                        + (f":{c['line']}" if c.get("line") else ""), "comment": "comment"}[c["kind"]]
+                who = c["author"]
+                d.text(self.s(x0 + pad + 4, y + 9), who, font=self.f_day_bold, fill=(*ACCENT, 255), anchor="lm")
+                ww = self.f_day_bold.getlength(who) / self.px
+                d.text(self.s(x0 + pad + 4 + ww + 6, y + 9), self._fit(f"{what} · {ago(c['at'])}", self.f_hint,
+                                                                        width - ww - 12),
+                       font=self.f_hint, fill=muted, anchor="lm")
+                for i, ln in enumerate(lines):
+                    d.text(self.s(x0 + pad + 4, y + 18 + 15 * i + 7), ln, font=self.f_hint, fill=ink, anchor="lm")
+            y += h
+        if hidden:
+            d.text(self.s(x0 + pad, y + 9), f"{hidden} more below · scroll down", font=self.f_hint, fill=muted, anchor="lm")
+
+    def _wrap_chars(self, text, font, width):
+        """Lines of text broken anywhere to fit `width` (for code and data, where words are long)."""
+        out = []
+        limit = width * self.px
+        for line in text.split("\n"):
+            line = line.replace("\t", "    ")
+            while line and font.getlength(line) > limit:
+                n = max(1, int(len(line) * limit / font.getlength(line)))
+                while n > 1 and font.getlength(line[:n]) > limit:
+                    n -= 1
+                out.append(line[:n])
+                line = line[n:]
+            out.append(line)
+        return out
+
+    def _decoder(self, d, dec):
+        """Paste or type something, Decode shows what it is (JWT claims, a date, pretty JSON...),
+        Copy puts the result on the clipboard; a stack trace can be sent for an explanation."""
+        ink, muted = (*INK, 255), (*MUTED, 255)
+        pad, x0, x1 = 12, self.left + 16, self.w - 16
+        width = x1 - x0 - 2 * pad
+        result = dec.get("result")
+
+        # The text being decoded: its last lines, so the caret stays in view.
+        draft = dec["draft"]
+        lines = self._wrap_chars(draft, self.f_mono, width - 20)[-4:] if draft else []
+        input_h = max(1, len(lines)) * 15 + 14
+
+        rows = []  # (kind, height, payload): the result, scrollable
+        if result:
+            for heading, text in result.sections:
+                rows.append(("head", 18, heading))
+                rows += [("mono", 15, ln) for ln in self._wrap_chars(text, self.f_mono, width - 8)]
+                rows.append(("gap", 6, None))
+        if dec.get("explanation"):
+            rows.append(("head", 18, "Explanation"))
+            rows += [("prose", 15, ln) for ln in self._wrap(dec["explanation"], self.f_hint, width - 8)]
+        self.dec_rows = len(rows)
+
+        title_h, buttons_h = 28, 34
+        fixed = pad + title_h + input_h + 8 + buttons_h + pad
+        max_h = self.h - TOP_BAR - 50
+        skip = max(0, min(dec.get("skip", 0), len(rows) - 1)) if rows else 0
+        used, shown = fixed + (16 if skip else 0), []
+        for i, row in enumerate(rows[skip:], skip):
+            if used + row[1] + (16 if i < len(rows) - 1 else 0) > max_h:
+                break
+            shown.append(row)
+            used += row[1]
+        below = len(rows) - skip - len(shown)
+        if below:
+            used += 16
+        top, bottom, tail = self._bubble_box(used)
+        self._panel((x0, top, x1, bottom), self.left + self.model_w / 2 if tail else None)
+        self.regions.append(("dec_card", None, (x0, top, x1, bottom + (12 if tail else 0))))
+        self.card_top, self.card_bottom = top, bottom
+
+        y = top + pad
+        title = f"Decode · {result.kind}" if result else "Decode"
+        d.text(self.s(x0 + pad, y + 10), self._fit(title, self.f_title, width - 120), font=self.f_title,
+               fill=(*ACCENT, 255), anchor="lm")
+        d.text(self.s(x1 - pad, y + 10), "Enter: decode", font=self.f_hint, fill=muted, anchor="rm")
+        y += title_h
+
+        field = (x0 + pad, y, x1 - pad, y + input_h)
+        self._box(field, radius=8, edge=2, shadow=2)
+        self.regions.append(("dec_input", None, field))
+        tx = field[0] + 10
+        if lines:
+            for i, ln in enumerate(lines):
+                d.text(self.s(tx, y + 7 + 15 * i + 7), ln, font=self.f_mono, fill=ink, anchor="lm")
+            cy = y + 7 + 15 * (len(lines) - 1) + 7
+            caret = tx + self.f_mono.getlength(lines[-1]) / self.px + 1
+        else:
+            d.text(self.s(tx, y + 14), self._fit("Paste or type a JWT, timestamp, JSON, stack trace…", self.f_hint,
+                                                 width - 24), font=self.f_hint, fill=muted, anchor="lm")
+            cy, caret = y + 14, tx
+        self.caret = (caret, cy)
+        d.line(self.s(caret, cy - 7, caret, cy + 7), fill=ink, width=max(1, round(2 * self.px)))
+        y += input_h + 8
+
+        # Paste, Decode, Clear; Copy and Explain? once there is something to copy or explain.
+        bx = x0 + pad
+        buttons = [("dec_paste", "Paste", CARD), ("dec_run", "Decode", PRI), ("dec_clear", "Clear", CARD)]
+        if result or dec.get("explanation"):
+            buttons.append(("dec_copy", "Copy", CARD))
+        if result and result.explain:
+            buttons.append(("dec_explain", "Explain?", PINK))
+        for kind, label, fill in buttons:
+            w = self.f_mini.getlength(label) / self.px + 24
+            rect = (bx, y, bx + w, y + 26)
+            hovered = self.hover == (kind, None) and fill == CARD
+            self._box(self._pressed(kind, None, rect), TINT if hovered else fill, radius=9, edge=2, shadow=2.5)
+            d.text(self.s(bx + w / 2, y + 13), label, font=self.f_mini, fill=ink, anchor="mm")
+            self.regions.append((kind, None, rect))
+            bx += w + 6
+        status = dec.get("status") or ("" if dec.get("clipboard") else "Paste/Copy need wl-clipboard")
+        if status:
+            d.text(self.s(x1 - pad, y + 13), self._fit(status, self.f_hint, x1 - pad - bx - 6), font=self.f_hint,
+                   fill=muted, anchor="rm")
+        y += buttons_h
+
+        if skip:
+            d.text(self.s(x0 + pad, y + 8), "more above · scroll up", font=self.f_hint, fill=muted, anchor="lm")
+            y += 16
+        for kind, h, payload in shown:
+            if kind == "head":
+                d.text(self.s(x0 + pad, y + 9), payload, font=self.f_day_bold, fill=muted, anchor="lm")
+                if result and result.swatch and payload == result.sections[0][0]:  # the color itself
+                    sw = self.f_day_bold.getlength(payload) / self.px + 10
+                    self._box((x0 + pad + sw, y + 2, x0 + pad + sw + 40, y + 16), result.swatch, radius=4,
+                              edge=1.5, shadow=0)
+            elif kind == "mono":
+                d.text(self.s(x0 + pad + 4, y + 7), payload, font=self.f_mono, fill=ink, anchor="lm")
+            elif kind == "prose":
+                d.text(self.s(x0 + pad + 4, y + 7), payload, font=self.f_hint, fill=ink, anchor="lm")
+            y += h
+        if below:
+            d.text(self.s(x0 + pad, y + 8), f"{below} more lines · scroll down", font=self.f_hint, fill=muted,
+                   anchor="lm")
+
+    def _picker(self, d, pk):
+        """PR review: a small folder browser from ~/Projects (a repo goes on to its branches),
+        then the branch to review, compared with main or master. Opening hands it to Kiro."""
+        ink, muted = (*INK, 255), (*MUTED, 255)
+        pad, x0, x1 = 12, self.left + 16, self.w - 16
+        width = x1 - x0 - 2 * pad
+        folder_step = pk["step"] == "folder"
+        if folder_step:
+            items = [("up", "..", False)] + [("dir", n, repo) for n, repo in pk["entries"]]
+        else:
+            f = pk["filter"].lower()
+            items = [("branch", b, cur) for b, cur in pk["branches"] if f in b.lower()]
+        self.pk_rows = len(items)
+
+        title_h, info_h, row_h, buttons_h = 28, 22, 24, 36
+        filter_h = 0 if folder_step else 32
+        fixed = pad + title_h + info_h + filter_h + buttons_h + pad + 18
+        max_h = self.h - TOP_BAR - 50
+        skip = max(0, min(pk.get("skip", 0), len(items) - 1)) if items else 0
+        fit = max(1, int((max_h - fixed) // row_h))
+        shown = items[skip:skip + fit]
+        used = fixed + max(1, len(shown)) * row_h
+        top, bottom, tail = self._bubble_box(used)
+        self._panel((x0, top, x1, bottom), self.left + self.model_w / 2 if tail else None)
+        self.regions.append(("pk_card", None, (x0, top, x1, bottom + (12 if tail else 0))))
+        self.card_top, self.card_bottom = top, bottom
+
+        y = top + pad
+        d.text(self.s(x0 + pad, y + 10), "PR review", font=self.f_title, fill=(*ACCENT, 255), anchor="lm")
+        d.text(self.s(x1 - pad, y + 10), "pick a repo folder" if folder_step else "pick the branch to review",
+               font=self.f_hint, fill=muted, anchor="rm")
+        y += title_h
+        if folder_step:
+            home = str(Path.home())
+            where = str(pk["path"]).replace(home, "~", 1)
+            d.text(self.s(x0 + pad, y + 9), self._fit(where, self.f_day_bold, width), font=self.f_day_bold, fill=ink,
+                   anchor="lm")
+        else:
+            name = Path(pk["repo"]).name
+            d.text(self.s(x0 + pad, y + 9), name, font=self.f_day_bold, fill=ink, anchor="lm")
+            nw = self.f_day_bold.getlength(name) / self.px
+            d.text(self.s(x0 + pad + nw + 8, y + 9), f"compared with {pk['base']}", font=self.f_hint, fill=muted,
+                   anchor="lm")
+        y += info_h
+        if not folder_step:  # type to narrow the branches down
+            field = (x0 + pad, y, x1 - pad, y + 26)
+            self._box(field, radius=8, edge=2, shadow=2)
+            self.regions.append(("pk_filter", None, field))
+            if pk["filter"]:
+                d.text(self.s(field[0] + 10, y + 13), self._fit(pk["filter"], self.f_item, width - 24),
+                       font=self.f_item, fill=ink, anchor="lm")
+            else:
+                d.text(self.s(field[0] + 10, y + 13), "Type to filter branches", font=self.f_hint, fill=muted,
+                       anchor="lm")
+            caret = field[0] + 10 + self.f_item.getlength(pk["filter"]) / self.px + 1
+            self.caret = (caret, y + 13)
+            d.line(self.s(caret, y + 6, caret, y + 20), fill=ink, width=max(1, round(2 * self.px)))
+            y += filter_h
+
+        if skip:
+            d.text(self.s(x1 - pad, y - 4), "more above", font=self.f_hint, fill=muted, anchor="rs")
+        if not shown:
+            d.text(self.s(x0 + pad, y + row_h / 2), "No folders here" if folder_step else "No branch matches",
+                   font=self.f_hint, fill=muted, anchor="lm")
+        for i, (kind, label, flag) in enumerate(shown, skip):
+            rect = (x0 + 6, y, x1 - 6, y + row_h - 2)
+            selected = kind == "branch" and label == pk.get("selected")
+            if selected:
+                self._box(rect, PRI, radius=7, edge=2, shadow=0)
+            elif self.hover == ("pk_row", i):
+                self._box(rect, TINT, radius=7, edge=0, shadow=0)
+            if kind == "up":
+                d.text(self.s(x0 + pad + 4, y + 11), "..  up a folder", font=self.f_hint, fill=muted, anchor="lm")
+            else:
+                d.text(self.s(x0 + pad + 4, y + 11), self._fit(label, self.f_day, width - 70), font=self.f_day,
+                       fill=ink, anchor="lm")
+                tag = ("git" if flag else None) if kind == "dir" else ("current" if flag else None)
+                if tag:
+                    tw = self.f_hint.getlength(tag) / self.px + 12
+                    self._box((x1 - pad - tw, y + 4, x1 - pad, y + row_h - 6), SOFT if kind == "dir" else TINT,
+                              radius=6, edge=1.2, shadow=0)
+                    d.text(self.s(x1 - pad - tw / 2, y + 11), tag, font=self.f_hint, fill=ink, anchor="mm")
+            self.regions.append(("pk_row", i, rect))
+            y += row_h
+        if len(items) > skip + len(shown):
+            d.text(self.s(x1 - pad, y + 8), f"{len(items) - skip - len(shown)} more below · scroll", font=self.f_hint,
+                   fill=muted, anchor="rm")
+        y = bottom - pad - buttons_h + 6
+
+        bx = x0 + pad
+        buttons = [("pk_cancel", "Cancel", CARD)] if folder_step else \
+            [("pk_back", "Back", CARD), ("pk_open", "Open in Kiro", PRI if pk.get("selected") else TRACK)]
+        for kind, label, fill in buttons:
+            w = self.f_mini.getlength(label) / self.px + 24
+            rect = (bx, y, bx + w, y + 26)
+            hovered = self.hover == (kind, None) and fill == CARD
+            self._box(self._pressed(kind, None, rect), TINT if hovered else fill, radius=9, edge=2, shadow=2.5)
+            d.text(self.s(bx + w / 2, y + 13), label, font=self.f_mini, fill=ink, anchor="mm")
+            self.regions.append((kind, None, rect))
+            bx += w + 6
+        if pk.get("status"):
+            d.text(self.s(x1 - pad, y + 13), self._fit(pk["status"], self.f_hint, x1 - pad - bx - 6), font=self.f_hint,
+                   fill=muted, anchor="rm")
+
+    def _settings(self, d, st):
+        """Settings: which monitor the apps she opens go to (Kiro from PR Review, apps opened by
+        voice). 'Largest' follows whichever monitor is biggest, even after they change."""
+        ink, muted = (*INK, 255), (*MUTED, 255)
+        pad, x0, x1 = 12, self.left + 16, self.w - 16
+        width = x1 - x0 - 2 * pad
+        rows = [("auto", "Largest monitor", f"now {st['largest']}" if st["largest"] else "")]
+        rows += [(name, name, f"{model} · {w}×{h}" if model else f"{w}×{h}") for name, w, h, model in st["monitors"]]
+        row_h = 28
+        used = pad + 28 + 34 + len(rows) * row_h + (18 if not st["available"] else 0) + 8 + 34 + pad
+        top, bottom, tail = self._bubble_box(used)
+        self._panel((x0, top, x1, bottom), self.left + self.model_w / 2 if tail else None)
+        self.regions.append(("set_card", None, (x0, top, x1, bottom + (12 if tail else 0))))
+        self.card_top, self.card_bottom = top, bottom
+
+        y = top + pad
+        d.text(self.s(x0 + pad, y + 10), "Settings", font=self.f_title, fill=(*ACCENT, 255), anchor="lm")
+        y += 28
+        d.text(self.s(x0 + pad, y + 8), "Open apps on", font=self.f_day_bold, fill=ink, anchor="lm")
+        d.text(self.s(x0 + pad, y + 24), self._fit("Kiro from PR Review, and apps she opens for you", self.f_hint,
+                                                   width), font=self.f_hint, fill=muted, anchor="lm")
+        y += 34
+        for i, (key, label, detail) in enumerate(rows):
+            rect = (x0 + 6, y, x1 - 6, y + row_h - 3)
+            if key == st["choice"]:
+                self._box(rect, PRI, radius=8, edge=2, shadow=0)
+            elif self.hover == ("set_mon", i):
+                self._box(rect, TINT, radius=8, edge=0, shadow=0)
+            d.text(self.s(x0 + pad + 4, y + 12), label, font=self.f_day_bold if key == "auto" else self.f_day,
+                   fill=ink, anchor="lm")
+            lw = (self.f_day_bold if key == "auto" else self.f_day).getlength(label) / self.px
+            d.text(self.s(x0 + pad + 4 + lw + 8, y + 12), detail, font=self.f_hint, fill=muted, anchor="lm")
+            tags = [] if key == "auto" else [t for t, on in (("largest", key == st["largest"]),
+                                                             ("she's here", key == st["here"])) if on]
+            tx = x1 - pad
+            for tag in reversed(tags):
+                tw = self.f_hint.getlength(tag) / self.px + 12
+                self._box((tx - tw, y + 4, tx, y + row_h - 7), SOFT if tag == "largest" else TINT, radius=6,
+                          edge=1.2, shadow=0)
+                d.text(self.s(tx - tw / 2, y + 11), tag, font=self.f_hint, fill=ink, anchor="mm")
+                tx -= tw + 4
+            self.regions.append(("set_mon", i, rect))
+            y += row_h
+        if not st["available"]:
+            d.text(self.s(x0 + pad, y + 9), "Moving windows needs the COSMIC desktop", font=self.f_hint, fill=(*ALERT, 255),
+                   anchor="lm")
+            y += 18
+        y = bottom - pad - 28
+        w = self.f_mini.getlength("Done") / self.px + 28
+        rect = (x0 + pad, y, x0 + pad + w, y + 26)
+        self._box(self._pressed("set_done", None, rect), TINT if self.hover == ("set_done", None) else PRI, radius=9,
+                  edge=2, shadow=2.5)
+        d.text(self.s(rect[0] + w / 2, y + 13), "Done", font=self.f_mini, fill=ink, anchor="mm")
+        self.regions.append(("set_done", None, rect))
+
     def _voice(self, d, v):
         """Mic button (top-left) and a banner with what she heard / is doing / Run-Cancel."""
         ink = (*INK, 255)
@@ -741,11 +1152,11 @@ class Overlay:
     def _column_height(self, active, opened):
         """Height of the whole left column (big buttons, actions, moves) as drawn below."""
         rows = lambda n: (n + 1) // 2  # noqa: E731  two per row
-        h = len(self.buttons) * 48 + rows(len(self.actions)) * 34
+        h = len(self.buttons) * BUTTON_STEP + rows(len(self.actions)) * 34
         if self.moves:
             h += 22
             if opened:
-                h += 4 + sum(18 + rows(len(g["moves"])) * 28 + 2 for g in self.moves) + (24 if active else 0)
+                h += 4 + sum(18 + rows(len(g["moves"])) * 26 + 2 for g in self.moves) + (22 if active else 0)
         return h
 
     def _actions(self, d, y, on):
@@ -770,7 +1181,7 @@ class Overlay:
         A 'Moves' header collapses them (they can cover her arm on narrow screens)."""
         ink = (*INK, 255)
         x0, x1 = 12, PANEL_W - 12
-        col_w, row_h, gap = (x1 - x0 - 4) / 2, 24, 4
+        col_w, row_h, gap = (x1 - x0 - 4) / 2, 22, 4
 
         header = (x0, y, x1, y + 22)
         self._box(header, TINT if self.hover == ("moves_toggle", None) else CARD, radius=11, edge=2, shadow=2)
@@ -884,7 +1295,7 @@ class Overlay:
 
         bottom = max(used + TOP_BAR, head - tail)  # the bubble's tail points at the top of her head
         top = bottom - used
-        self.card_top = top
+        self.card_top, self.card_bottom = top, bottom
         cx = self.left + self.model_w / 2
         self._panel((x0, top, x1, bottom), cx, tail)
         self.regions.append(("card", None, (x0, top, x1, bottom + tail)))

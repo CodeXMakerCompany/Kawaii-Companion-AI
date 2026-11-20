@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Stand-in for COSMIC's deprecated cosmic-workspace-unstable-v1: the toplevel protocols still
+     name its workspace handle in a few events and one request, which this app never uses (it
+     moves windows with the ext-workspace handles instead). Only the name is needed. -->
+<protocol name="cosmic_workspace_unstable_v1">
+  <interface name="zcosmic_workspace_handle_v1" version="1"/>
+</protocol>

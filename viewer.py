@@ -10,6 +10,21 @@ Controls
   Talk button       she talks for 10 seconds (click again to stop early)
   Dance button      she dances on a beat until clicked again
   Pose button       she strikes 5 photo poses in a row (click again to stop)
+  Think button      finger on her chin, mulling it over (click again: she gets it)
+  Huh? (mini)       a puzzled double take, the '?' popping up (click again to stop)
+  Decode button     paste or type a JWT, timestamp, JSON, base64, URL, stack trace...: Decode shows
+                    it readable, Copy copies it (Paste/Copy use wl-clipboard), Explain? sends a
+                    stack trace to OpenRouter; Enter decodes, Ctrl+V pastes, Esc closes
+  PR Review button  pick a repo under ~/Projects and a branch: Kiro opens on it with a new chat
+                    asking to review that branch against main/master, typed in but not sent
+  Settings (mini)   which monitor the apps she opens go to (largest by default); COSMIC only
+  GitHub badge      new comments on your open pull requests (gh checks every 15 min): she says
+                    what happened; click it to read them and see the repo (read only), Esc closes
+  Kiro / Claude     while the app is open its icon floats by her head (Kiro right, Claude
+                    left); while one of its agents works the icon's dots spin and she thinks
+                    it over looking at it; when the last one is done she gets it. When one
+                    waits on you (a permission, a question) its icon hops with a '?' and she
+                    does 'huh?' double takes at it, turning to you
   Walk / Greet      she strolls side to side (until clicked again) / bows and waves hello
   Calendar button   pick a date, type a title, Add reminder; on the day she nags until Done
   top-right pill    CPU/GPU/RAM at a glance; click for the full monitor (alarms nag until dismissed)
@@ -58,9 +73,14 @@ with contextlib.redirect_stdout(io.StringIO()):  # live2d-py prints a banner on 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))  # run.sh uses python -I, which leaves the script dir off sys.path
 from fx import Effects, Press
+from agents import WAITING, WATCHERS, WORKING
+from prwatch import PRWatcher
+import decode
+import prreview
+from winmove import WindowMover
 from sysmon import SystemMonitor
 from speech import Speaker
-from voice import VoiceAssistant
+from voice import VoiceAssistant, openrouter
 from ui import NOTES_H, PANEL_W, Events, Overlay, Pendings
 from wl_window import BTN_LEFT, BTN_RIGHT, LayerWindow
 
@@ -79,7 +99,8 @@ TALK_SECONDS = 10
 # UI element kinds that react to a click (pointer cursor + hover highlight).
 CLICKABLE = ("button", "item", "move", "moves_toggle", "action", "cal_prev", "cal_next", "cal_day", "cal_save",
              "cal_new", "cal_delete", "cal_event", "cal_done", "cal_yearly", "alert_action", "monitor_toggle",
-             "mic", "voice_run", "voice_cancel")
+             "mic", "voice_run", "voice_cancel", "gh_badge", "dec_paste", "dec_run", "dec_clear", "dec_copy",
+             "dec_explain", "pk_row", "pk_back", "pk_open", "pk_cancel", "set_mon", "set_done")
 
 MIN_MODEL, MAX_MODEL = (300, 360), (1600, 2200)  # her area, in px
 SILHOUETTE_BAND = 24  # px; input-region rows follow her outline in bands this tall
@@ -88,6 +109,7 @@ FIT_PAD = 0.03  # space left around her when fitting, as a fraction of the area
 
 # evdev key codes (layout independent, like VTube Studio's hotkeys)
 KEY_ESC, KEY_BACKSPACE, KEY_ENTER, KEY_KPENTER, KEY_R, KEY_F10 = 1, 14, 28, 96, 19, 68
+KEY_C, KEY_V = 46, 47
 _KP = {1: 79, 2: 80, 3: 81, 4: 75, 5: 76, 6: 77, 7: 71, 8: 72, 9: 73, 0: 82}
 _FKEYS = {1: 59, 2: 60, 3: 61, 4: 62, 5: 63, 6: 64, 7: 65, 8: 66, 9: 67, 10: 68, 11: 87, 12: 88}
 
@@ -386,6 +408,224 @@ class Greeter:
         return params
 
 
+class Thinker:
+    """A thinking pose: finger on her chin (the 点点 drawing), head leaning into the hand,
+    eyes wandering up and away while she mulls it over, then a small 'got it' when it ends.
+
+    Nothing loops, so it reads as thinking rather than an animation: the eyes jump to a new
+    spot at random moments (now and then down at nothing) and the head follows a beat
+    later, the sway is two slow unrelated sines, the mouth purses on and off. Ending it
+    lifts her brows, drops the hand, and she smiles with a little nod."""
+
+    HAND = "Param79"  # 点点: index finger on her chin
+    IN, OUT, AHA = 0.8, 0.6, 1.0  # seconds: settle in, relax, the 'got it'
+    TILT = 1  # head and body lean toward the hand (screen-left)
+
+    def __init__(self):
+        self.t = None  # seconds into the thought, None when not thinking
+        self.aha = None  # seconds into the 'got it', after stopping
+        self.env = 0.0  # overall weight, eases in/out
+        self.hand = 0.0  # the hand drawing: switched in fast, a slow cross-fade looks ghostly
+        self.clock = 0.0
+        self.phase = 0.0
+        self.eye = [0.0, 0.0]  # gaze: snaps to a new spot (a saccade)
+        self.look = [0.0, 0.0]  # where the head points: follows the gaze slowly
+        self.target = (0.0, 0.0)
+        self.next_glance = 0.0
+        self.purse, self.purse_to = 0.0, 0.0
+        self.side = 1  # which way she looks: 1 screen-right, -1 screen-left (set before starting)
+
+    @property
+    def active(self):
+        return self.t is not None
+
+    def toggle(self):
+        if self.active:
+            self.stop()
+        else:
+            self.t, self.aha, self.next_glance = 0.0, None, 0.3
+            self.phase = random.uniform(0, 100)  # the sway starts somewhere new each time
+
+    def stop(self, aha=True):
+        """aha=False: just relax (it isn't over, something else needs her)."""
+        if self.active:
+            self.t, self.aha = None, 0.0 if aha else None
+
+    @staticmethod
+    def _glance():
+        """A spot up and to her looking side; now and then down, considering."""
+        if random.random() < 0.22:
+            return random.uniform(-0.1, 0.35), random.uniform(-0.45, -0.2)
+        return random.uniform(0.35, 0.85), random.uniform(0.35, 0.8)
+
+    def update(self, dt):
+        """Advance; returns {param: (value, weight)} or None when she isn't thinking."""
+        self.clock += dt
+        if self.active:
+            self.t += dt
+            if self.t >= self.next_glance:
+                gx, gy = self._glance()
+                self.target = (gx * self.side, gy)
+                self.next_glance = self.t + random.uniform(0.9, 2.6)
+            if random.random() < dt / 2.2:  # a thoughtful purse of the lips, on and off
+                self.purse_to = random.uniform(0.15, 0.6) if random.random() < 0.6 else 0.0
+        else:
+            self.target, self.purse_to = (0.0, 0.1), 0.0  # back to looking ahead
+        if self.aha is not None:
+            self.aha += dt
+            if self.aha >= self.AHA:
+                self.aha = None
+        settling = self.active or self.aha is not None
+        self.env = min(1.0, self.env + dt / self.IN) if settling else max(0.0, self.env - dt / self.OUT)
+        want_hand = 1.0 if self.active and self.t > 0.3 else 0.0
+        self.hand += max(-dt / 0.16, min(dt / 0.16, want_hand - self.hand))
+        if self.env == 0.0:
+            return None
+
+        k_eye, k_head = 1 - math.exp(-dt * 28), 1 - math.exp(-dt * 2.2)
+        for i in (0, 1):
+            self.eye[i] += (self.target[i] - self.eye[i]) * k_eye
+            self.look[i] += (self.eye[i] - self.look[i]) * k_head
+        self.purse += (self.purse_to - self.purse) * (1 - math.exp(-dt * 4))
+        c, ph = self.clock, self.phase
+        sway = 0.6 * math.sin(0.7 * c + ph) + 0.4 * math.sin(1.13 * c + 2 * ph)
+        drift = math.sin(0.53 * c + 3 * ph)
+
+        def bump(a, b):  # 0 -> 1 -> 0 over the 'got it' seconds a..b
+            k = (self.aha - a) / (b - a) if self.aha is not None else -1
+            return math.sin(math.pi * k) if 0 <= k <= 1 else 0.0
+
+        smile = min(1.0, self.aha / 0.35) if self.aha is not None else 0.0
+        brows_up, nod, oh = bump(0.0, 0.9), bump(0.2, 0.65), bump(0.05, 0.4)
+        lx, ly = self.look
+        e = self.env * self.env * (3 - 2 * self.env)  # smoothstep
+        lean = self.TILT * (1 - smile * 0.6)
+        params = {
+            "ParamAngleX": (-14 * lx + 1.5 * sway, e),
+            "ParamAngleY": (9 * ly + drift - 7 * nod, e),
+            "ParamAngleZ": (lean * (7 + 1.5 * sway), e),
+            "ParamEyeBallX": (self.eye[0], e),
+            "ParamEyeBallY": (self.eye[1], e),
+            "ParamBodyAngleX": (-3 * lx, e),
+            "ParamBodyAngleY": (-1.5, e),
+            "ParamBodyAngleZ": (lean * 2.5, e),
+            "ParamBrowLY": (0.35 * (1 - smile) + 0.7 * brows_up, e),  # one brow up, the other knit
+            "ParamBrowRY": (-0.15 * (1 - smile) + 0.7 * brows_up, e),
+            "ParamBrowRAngle": (-0.35 * (1 - smile), e),
+            "ParamBrowRForm": (-0.4 * (1 - smile), e),
+            "Param13": (self.purse * (1 - smile), e),
+            "ParamMouthForm": (-0.25 * (1 - smile) + 0.9 * smile, e),
+            "ParamMouthOpenY": (0.3 * oh, e),
+            "ParamEyeLSmile": (0.5 * smile, e),
+            "ParamEyeRSmile": (0.5 * smile, e),
+            "ParamCheek": (0.25 * smile, e),
+            self.HAND: (self.hand, 1.0 if self.hand > 0 else e),
+        }
+        return params
+
+
+class Huh:
+    """'Huh?': something is waiting on you. She does a double take at it (eyes first, then
+    the head, to the side it is on), turns back to you with her head cocked, brows up, a
+    little 'huh?' and the model's '?' popping up by her head. Between double takes she
+    waits looking at you, swaying a little and glancing over at it now and then; the double
+    takes come less often the longer it waits, so a long wait doesn't turn into a loop."""
+
+    QUESTION = "Param61"  # 疑问: a '?' by her head (it also blanks her eyes, so only in the beats)
+    IN, OUT = 0.35, 0.5
+    BEAT = 2.4  # seconds one double take lasts
+
+    def __init__(self):
+        self.t = None  # seconds into the wait, None when not waiting
+        self.env = 0.0
+        self.side = 1  # where the waiting thing is: 1 screen-right, -1 screen-left
+        self.clock, self.phase = 0.0, 0.0
+        self.beat_at, self.next_beat, self.gap = 0.0, 0.0, 7.0
+        self.beats = 0  # double takes so far (the viewer adds effects to each)
+        self.mark = 0.0  # the '?' drawing, switched in fast
+        self.eye, self.look = [0.0, 0.0], [0.0, 0.0]
+        self.peek_at, self.next_peek = None, 0.0  # a glance at it between double takes
+
+    @property
+    def active(self):
+        return self.t is not None
+
+    def toggle(self):
+        if self.active:
+            self.stop()
+        else:
+            self.t, self.beat_at, self.gap = 0.0, 0.0, 7.0
+            self.next_beat, self.next_peek = self.BEAT + self.gap, self.BEAT + 2.0
+            self.beats += 1  # the first double take starts right away
+            self.phase = random.uniform(0, 100)
+
+    def stop(self):
+        self.t = None
+
+    def update(self, dt):
+        """Advance; returns {param: (value, weight)} or None when she isn't waiting."""
+        self.clock += dt
+        b = None  # seconds into the current double take
+        if self.active:
+            self.t += dt
+            if self.t >= self.next_beat:
+                self.beat_at, self.beats = self.t, self.beats + 1
+                self.next_beat = self.t + self.BEAT + self.gap
+                self.gap = min(30.0, self.gap * 1.35)  # less and less often
+            b = self.t - self.beat_at if self.t - self.beat_at < self.BEAT else None
+            if b is None and self.t >= self.next_peek:
+                self.peek_at, self.next_peek = self.t, self.t + random.uniform(2.5, 4.5)
+            peeking = self.peek_at is not None and self.t - self.peek_at < 0.8 and b is None
+            if b is not None and b < 0.45:  # the double take: a look at it...
+                target = (0.8 * self.side, 0.3)
+            elif peeking:
+                target = (0.65 * self.side, 0.2)
+            else:  # ...then at you
+                target = (0.08 * math.sin(self.clock * 0.7 + self.phase), 0.05)
+            want_mark = 1.0 if b is not None and 0.5 <= b < 2.0 else 0.0
+        else:
+            target, want_mark = (0.0, 0.0), 0.0
+        self.env = min(1.0, self.env + dt / self.IN) if self.active else max(0.0, self.env - dt / self.OUT)
+        self.mark += max(-dt / 0.12, min(dt / 0.12, want_mark - self.mark))
+        if self.env == 0.0:
+            return None
+
+        k_eye, k_head = 1 - math.exp(-dt * 30), 1 - math.exp(-dt * 3.0)
+        for i in (0, 1):
+            self.eye[i] += (target[i] - self.eye[i]) * k_eye
+            self.look[i] += (self.eye[i] - self.look[i]) * k_head
+
+        def ramp(a, c):  # 0 before a, 1 after c, smooth in between (over the double take)
+            if b is None:
+                return 0.0
+            k = min(1.0, max(0.0, (b - a) / (c - a)))
+            return k * k * (3 - 2 * k)
+
+        cock = 0.45 + 0.55 * ramp(0.4, 0.75) * (1 - ramp(1.9, self.BEAT))  # head cocked, more in a beat
+        back = ramp(0.45, 0.6) * (1 - ramp(0.6, 0.95))  # a little jerk back on 'huh?'
+        huh = ramp(0.5, 0.65) * (1 - ramp(0.75, 1.0))  # the syllable
+        sway = math.sin(0.8 * self.clock + self.phase)
+        lx, ly = self.look
+        e = self.env * self.env * (3 - 2 * self.env)
+        return {
+            "ParamAngleX": (-16 * lx + sway, e),
+            "ParamAngleY": (6 * ly + 4 * back, e),
+            "ParamAngleZ": (self.side * (4 + 9 * cock), e),
+            "ParamEyeBallX": (self.eye[0], e),
+            "ParamEyeBallY": (self.eye[1], e),
+            "ParamBodyAngleX": (-3 * lx, e),
+            "ParamBodyAngleY": (2 * back, e),
+            "ParamBodyAngleZ": (self.side * 2.5 * cock, e),
+            "ParamBrowLY": (0.25 + 0.55 * cock, e),  # both up, one more
+            "ParamBrowRY": (0.1 + 0.4 * cock, e),
+            "ParamBrowLAngle": (0.3 * cock, e),
+            "Param13": (0.35 * cock * self.side, e),  # a puzzled, crooked mouth
+            "ParamMouthForm": (-0.35, e),
+            "ParamMouthOpenY": (0.4 * huh, e),
+            self.QUESTION: (self.mark, 1.0 if self.mark > 0 else e),
+        }
+
+
 class OverlayTexture:
     """A UI layer as one GL texture, blended over the model with a single quad (the whole
     window by default, or a small rectangle such as the system monitor)."""
@@ -595,7 +835,9 @@ def main():
     poser = PoseShow()
     walker = Walker()
     greeter = Greeter()
-    routines = (dancer, poser, walker, greeter)  # each drives her whole body: one at a time
+    thinker = Thinker()
+    huh = Huh()
+    routines = (dancer, poser, walker, greeter, thinker, huh)  # each drives her whole body: one at a time
     moves_file = HERE / "moves.json"  # labelled, grouped mini buttons; falls back to raw names
     if moves_file.exists():
         move_groups = json.loads(moves_file.read_text(encoding="utf-8"))["groups"]
@@ -608,6 +850,14 @@ def main():
     effects = Effects(enabled=not args.no_fx and animations_enabled())
     fx_tex = OverlayTexture(1, 1)  # the effects' layer, only drawn while one is alive
     presses = {}  # (kind, name) -> Press, for buttons springing back from a click
+    agent_apps = [W() for W in WATCHERS]  # Kiro, Claude
+    badges = {}  # app name -> its floating icon, while the app is open
+    prs = PRWatcher(CONFIG_DIR / "prwatch.json")
+    gh_icon = CONFIG_DIR / "github.png"  # optional: your own GitHub icon; a pull-request symbol otherwise
+    reviewer = prreview.Reviewer()
+    mover = WindowMover()  # puts the windows of apps she opens on the monitor you chose
+    explainer = decode.Explainer(lambda system, text: openrouter(assistant.key_file, assistant.models, system, text,
+                                                                 max_tokens=350))
     after_paint = []  # effects placed by the next repaint's layout (the caret, a new bubble)
 
     view = {
@@ -657,6 +907,37 @@ def main():
         "next_pulse": 0.0,  # mic ring while listening
         "next_rumble": 0.0,  # ゴゴゴゴ while dancing
         "next_step": 0.0,  # dust while walking
+        "next_ponder": 0.0,  # thought bubble while thinking
+        "agents_working": False,  # an agent works in Kiro or Claude
+        "agents_think": False,  # she is thinking because of them
+        "agents_dismissed": False,  # you stopped her thinking while they work
+        "agents_waiting": False,  # an agent waits on you
+        "agents_huh": False,  # she is going 'huh?' because of them
+        "huh_dismissed": False,  # you stopped the 'huh?' while they wait
+        "huh_beats": 0,  # double takes already given their effects
+        "pr_open": False,  # the pull-request comments card
+        "pr_skip": 0,  # its rows scrolled past
+        "dec_open": False,  # the Decode card
+        "dec_draft": "",  # what is being decoded
+        "dec_result": None,  # decode.Result
+        "dec_status": "",  # a short note: Copied!, Asking..., why it failed
+        "dec_explanation": None,  # OpenRouter's explanation of the stack trace
+        "dec_skip": 0,  # result rows scrolled past
+        "dec_think": False,  # she is thinking while the explanation comes
+        "pk_open": False,  # the PR review picker
+        "pk_step": "folder",  # folder, then branch
+        "pk_path": prreview.START,  # the folder being browsed
+        "pk_entries": [],  # its subfolders [(name, is a repo)]
+        "pk_repo": None,  # the repo picked
+        "pk_branches": [],  # its branches [(name, is current)]
+        "pk_base": "main",
+        "pk_filter": "",  # typed to narrow the branches
+        "pk_selected": None,  # the branch to review
+        "pk_skip": 0,  # rows scrolled past
+        "pk_status": "",
+        "pk_close_at": None,  # the picker closes itself after a review was handed to Kiro
+        "set_open": False,  # the Settings card
+        "gh_hop_until": 0.0,  # the GitHub badge hops until then (new comments just came in)
         "walk_x": 0.0,
         "banner_shown": False,
     }
@@ -731,7 +1012,8 @@ def main():
     def set_open(on):
         if on:
             pendings.roll_day()
-            view["cal_open"] = False  # one card at a time
+            view["cal_open"] = view["dec_open"] = view["pk_open"] = view["set_open"] = False  # one card at a time
+            set_prs(False)
         view["open"] = on
         view["dirty"] = True
         refresh_silhouette(0.7)  # after the hand has finished moving
@@ -739,12 +1021,141 @@ def main():
     def set_calendar(on):
         if on:
             set_open(False)
+            set_prs(False)
+            view["dec_open"] = view["pk_open"] = view["set_open"] = False
             today = datetime.date.today()
             if not view["cal_editing"]:
                 view["cal_month"], view["cal_selected"] = (today.year, today.month), today.isoformat()
         view["cal_open"] = on
         view["dirty"] = True
         view["next_alert_check"] = 0.0
+
+    def set_prs(on):
+        """The pull-request comments card; closing it marks them read (and the badge goes)."""
+        if on:
+            view["open"] = view["cal_open"] = view["dec_open"] = view["pk_open"] = view["set_open"] = False
+        elif view["pr_open"]:
+            prs.mark_read()
+        view.update(pr_open=on, pr_skip=0, dirty=True)
+
+    def set_decoder(on):
+        if on:
+            view["open"] = view["cal_open"] = view["pk_open"] = view["set_open"] = False  # one card at a time
+            set_prs(False)
+        view.update(dec_open=on, dirty=True)
+
+    def set_settings(on):
+        if on:
+            view["open"] = view["cal_open"] = view["dec_open"] = view["pk_open"] = False  # one card at a time
+            set_prs(False)
+        view.update(set_open=on, dirty=True)
+
+    def app_output():
+        """The monitor apps she opens should land on: your choice, or the largest one."""
+        choice = state.get("app_output", "auto")
+        names = [m[0] for m in mover.monitors]
+        return choice if choice in names else mover.largest()
+
+    def set_picker(on):
+        """The PR review picker, opening on ~/Projects."""
+        if on:
+            view["open"] = view["cal_open"] = view["dec_open"] = view["set_open"] = False  # one card at a time
+            set_prs(False)
+            start = prreview.START if prreview.START.is_dir() else Path.home()
+            view.update(pk_step="folder", pk_path=start, pk_entries=prreview.folders(start), pk_skip=0, pk_status="",
+                        pk_close_at=None)
+        view.update(pk_open=on, dirty=True)
+
+    def browse(path):
+        view.update(pk_path=path, pk_entries=prreview.folders(path), pk_skip=0, dirty=True)
+
+    def picker_items():
+        """The rows as the picker draws them (to know what a click hit)."""
+        if view["pk_step"] == "folder":
+            return [("up", None)] + [("dir", e) for e in view["pk_entries"]]
+        f = view["pk_filter"].lower()
+        return [("branch", b) for b, _ in view["pk_branches"] if f in b.lower()]
+
+    def pick_row(i):
+        items = picker_items()
+        if not 0 <= i < len(items):
+            return
+        kind, item = items[i]
+        if kind == "up":
+            if view["pk_path"] != Path.home():
+                browse(view["pk_path"].parent)
+        elif kind == "dir":
+            name, repo = item
+            path = view["pk_path"] / name
+            if not repo:
+                browse(path)
+                return
+            found, base = prreview.branches(path)
+            current = next((b for b, cur in found if cur), found[0][0] if found else None)
+            view.update(pk_step="branch", pk_repo=path, pk_branches=found, pk_base=base, pk_filter="",
+                        pk_selected=current, pk_skip=0, pk_status="" if found else "No branches found", dirty=True)
+        else:
+            view.update(pk_selected=item, dirty=True)
+
+    def open_review(rect=None):
+        if view["pk_selected"] and not reviewer.busy:
+            reviewer.start(view["pk_repo"], view["pk_selected"], view["pk_base"])
+            # Kiro's window (a new one, or the one already showing this repo) goes to your monitor.
+            mover.expect(app_output(), app="kiro", title=Path(view["pk_repo"]).name, seconds=45)
+            view.update(pk_status="Opening Kiro…", dirty=True)
+            if rect:
+                effects.tap(rect)
+
+    def run_decoder(rect=None):
+        """Decode the draft: the result shows in the card."""
+        result = decode.decode(view["dec_draft"])
+        view.update(dec_result=result, dec_explanation=None, dec_skip=0, dirty=True,
+                    dec_status="" if result or not view["dec_draft"].strip() else "Nothing to decode")
+        if result and rect:
+            effects.done(rect)
+
+    def paste_decoder(rect=None):
+        text = decode.clipboard_get() if decode.has_clipboard() else None
+        if text is None:
+            view.update(dec_status="Install wl-clipboard to paste" if not decode.has_clipboard()
+                        else "The clipboard has no text", dirty=True)
+            return
+        view["dec_draft"] = text
+        run_decoder(rect)  # pasting is asking: show it right away
+
+    def copy_decoder(rect=None):
+        result = view["dec_result"]
+        text = view["dec_explanation"] or (result.copy if result else None)
+        if not text:
+            return
+        if decode.clipboard_set(text):
+            view["dec_status"] = "Copied!"
+            if rect:
+                effects.done(rect)
+        else:
+            view["dec_status"] = "Install wl-clipboard to copy"
+        view["dirty"] = True
+
+    def pr_spot():
+        """Where the GitHub badge floats: above her head (beside it when a card is open)."""
+        x, y = head()
+        if overlay.card_top is not None:  # under Claude's icon
+            return max(view["left"] + 34, x - 118), min(win.height - 40, agent_spot(-1)[1] + 66)
+        return x, max(70, y - 78)
+
+    def announce_prs(new, now):
+        """She says what came in: one comment, a review verdict, or how many."""
+        c = new[-1]
+        fields = {"who": c["author"], "repo": c["repo"].split("/")[-1].replace("-", " ").replace("_", " "),
+                  "number": c["number"], "count": len(new)}
+        kind = "pr_comments" if len(new) > 1 else {"APPROVED": "pr_approved", "CHANGES_REQUESTED": "pr_changes"}.get(
+            c.get("state") if c["kind"] == "review" else None, "pr_comment")
+        said = speaker.react(kind, **fields)
+        if not (said and speaker.available):
+            talker.start(now, 2.5)  # no voice: at least move her mouth
+        if not any(r.active for r in routines):
+            toggle_routine(greeter)  # 'hey!' with a wave
+        view["gh_hop_until"] = now + 6
 
     def save_reminder():
         title = view["cal_draft"].strip()
@@ -816,6 +1227,15 @@ def main():
         box, (mw, _) = view["body_box"], view["size"]
         x = view["left"] + ((box[0] + box[1]) / 2 if box else mw / 2)
         return x, overlay.head_y if overlay.head_y is not None else NOTES_H + 16
+
+    def agent_spot(side):
+        """Where an agent app's icon floats: up and to one side of her head (beside it instead,
+        under the card, when a card fills the space above)."""
+        x, y = head()
+        x = max(view["left"] + 34, min(x + side * 118, win.width - 34))
+        if overlay.card_top is not None:
+            return x, min(win.height - 40, max(y + 30, overlay.card_bottom + 40))
+        return x, max(70, y - 40)
 
     def impact_frame(hit):
         """The button turns inside out for an instant, then springs back."""
@@ -981,13 +1401,27 @@ def main():
                     overlay.rect_of("monitor_panel"), overlay.rect_of("monitor_toggle")))
             else:
                 effects.poof(rect[0] + 14, (rect[1] + rect[3]) / 2)
-        elif hit in (("button", "dance"), ("button", "pose"), ("action", "walk"), ("action", "greet")) \
-                and button == BTN_LEFT:
-            routine = {"dance": dancer, "pose": poser, "walk": walker, "greet": greeter}[hit[1]]
+        elif hit in (("button", "dance"), ("button", "pose"), ("button", "think"), ("action", "walk"),
+                     ("action", "greet"), ("action", "huh")) and button == BTN_LEFT:
+            routine = {"dance": dancer, "pose": poser, "think": thinker, "walk": walker, "greet": greeter,
+                       "huh": huh}[hit[1]]
             toggle_routine(routine)
             if hit[1] == "greet" and greeter.active:
                 speaker.react("greet")
-            if not routine.active:
+            if hit[1] == "think":
+                effects.pick(rect)
+                if thinker.active:
+                    view["next_ponder"] = time.perf_counter() + 0.7  # once the hand is up
+                else:
+                    effects.later(0.15, lambda: effects.idea(*head(), thinker.side))  # with her brows going up
+                    view["agents_dismissed"] = view["agents_working"]  # not again until they are done
+            elif hit[1] == "huh":
+                if huh.active:
+                    huh.side = 1  # your own 'huh?': at the empty space beside her
+                else:
+                    effects.poof(rect[2] - 8, (rect[1] + rect[3]) / 2, size=5)
+                    view["huh_dismissed"] = view["agents_waiting"]
+            elif not routine.active:
                 effects.poof(rect[2] - 12, (rect[1] + rect[3]) / 2)
             elif hit[1] == "dance":
                 impact_frame(hit)
@@ -1038,7 +1472,60 @@ def main():
                 pendings.remove(hit[1])
                 overlay.hover = None
             view["dirty"] = True
-        elif hit and hit[0] in ("card", "cal_card", "cal_input", "alert", "monitor_panel", "voice_banner"):
+        elif hit == ("action", "decode") and button == BTN_LEFT:
+            set_decoder(not view["dec_open"])
+            if view["dec_open"]:
+                effects.pick(rect)
+        elif hit and hit[0] in ("dec_paste", "dec_run", "dec_clear", "dec_copy", "dec_explain") and button == BTN_LEFT:
+            presses[hit] = Press()
+            if hit[0] == "dec_paste":
+                paste_decoder(rect)
+            elif hit[0] == "dec_run":
+                run_decoder(rect)
+            elif hit[0] == "dec_clear":
+                view.update(dec_draft="", dec_result=None, dec_explanation=None, dec_status="", dirty=True)
+            elif hit[0] == "dec_copy":
+                copy_decoder(rect)
+            elif not explainer.busy:  # Explain?: the only thing here that leaves the machine
+                explainer.start(view["dec_draft"])
+                view.update(dec_status="Asking OpenRouter…", dirty=True)
+                if not any(r.active for r in routines):
+                    toggle_routine(thinker)  # she thinks it over with you
+                    view["dec_think"] = True
+        elif hit == ("action", "settings") and button == BTN_LEFT:
+            set_settings(not view["set_open"])
+            if view["set_open"]:
+                effects.pick(rect)
+        elif hit and hit[0] == "set_mon" and button == BTN_LEFT:
+            choices = ["auto"] + [m[0] for m in mover.monitors]
+            if hit[1] < len(choices):
+                state["app_output"] = choices[hit[1]]
+                save_state(state)
+                effects.pick(rect)
+                view["dirty"] = True
+        elif hit == ("set_done", None) and button == BTN_LEFT:
+            set_settings(False)
+        elif hit == ("action", "review") and button == BTN_LEFT:
+            set_picker(not view["pk_open"])
+            if view["pk_open"]:
+                effects.pick(rect)
+        elif hit and hit[0] in ("pk_row", "pk_back", "pk_open", "pk_cancel") and button == BTN_LEFT:
+            if hit[0] == "pk_row":
+                pick_row(hit[1])
+            else:
+                presses[hit] = Press()
+                if hit[0] == "pk_back":
+                    view.update(pk_step="folder", pk_skip=0, pk_status="", dirty=True)
+                elif hit[0] == "pk_cancel":
+                    set_picker(False)
+                else:
+                    open_review(rect)
+        elif hit == ("gh_badge", None) and button == BTN_LEFT:
+            set_prs(not view["pr_open"])
+            if view["pr_open"]:
+                effects.pick(rect)
+        elif hit and hit[0] in ("card", "cal_card", "cal_input", "alert", "monitor_panel", "voice_banner", "pr_card",
+                                "dec_card", "dec_input", "pk_card", "pk_filter", "set_card"):
             pass  # clicking a card just keeps keyboard focus here (no drag)
         elif button == BTN_LEFT:
             kind = hit[1] if hit and hit[0] == "handle" else "move"
@@ -1047,11 +1534,36 @@ def main():
             win.set_cursor(cursor_for(hit))
 
     def on_scroll(steps):  # manual zoom around her centre; R refits
+        if view["pk_open"] and (overlay.hit(*view["mouse"]) or ("",))[0] in ("pk_card", "pk_row", "pk_filter"):
+            view.update(pk_skip=max(0, min(view["pk_skip"] - steps, overlay.pk_rows - 1)), dirty=True)
+            return
+        if view["dec_open"] and overlay.hit(*view["mouse"]) in (("dec_card", None), ("dec_input", None)):
+            view.update(dec_skip=max(0, min(view["dec_skip"] - steps, overlay.dec_rows - 1)), dirty=True)
+            return
+        if view["pr_open"] and overlay.hit(*view["mouse"]) in (("pr_card", None), ("gh_badge", None)):
+            skip = max(0, min(view["pr_skip"] - steps, overlay.pr_rows - 1))  # wheel down: further down the list
+            view.update(pr_skip=skip, dirty=True)
+            return
         set_transform(min(5.0, max(0.2, view["scale"] * (1.1 ** steps))), view["offset"])
         refresh_silhouette()
         remember_layout()
 
     def on_text(text):
+        if view["pk_open"]:
+            typed = "".join(c for c in text if c.isprintable())
+            if typed and view["pk_step"] == "branch":  # narrows the branch list
+                items_before = view["pk_filter"]
+                view.update(pk_filter=items_before + typed, pk_skip=0, dirty=True)
+                matches = [b for b, _ in view["pk_branches"] if view["pk_filter"].lower() in b.lower()]
+                if matches and view["pk_selected"] not in matches:
+                    view["pk_selected"] = matches[0]
+            return
+        if view["dec_open"]:
+            typed = "".join(c for c in text if c.isprintable())  # Ctrl+letters arrive as control characters
+            if typed:
+                view["dec_draft"] += typed
+                view["dirty"] = True
+            return
         if view["cal_open"]:
             view["cal_draft"] += text
             view["dirty"] = True
@@ -1067,6 +1579,33 @@ def main():
             return
         if key == KEY_F10 and win.xkb.alt():  # voice: start / stop listening
             assistant.toggle()
+            return
+        if view["pk_open"]:  # Enter opens the review, Backspace edits the filter (or goes up), Esc closes
+            if key == KEY_ESC:
+                set_picker(False)
+            elif key in (KEY_ENTER, KEY_KPENTER) and view["pk_step"] == "branch":
+                open_review(overlay.rect_of("pk_open"))
+            elif key == KEY_BACKSPACE:
+                if view["pk_step"] == "branch" and view["pk_filter"]:
+                    view.update(pk_filter=view["pk_filter"][:-1], dirty=True)
+                elif view["pk_step"] == "branch":
+                    view.update(pk_step="folder", pk_status="", dirty=True)
+                elif view["pk_path"] != Path.home():
+                    browse(view["pk_path"].parent)
+            return
+        if view["dec_open"]:  # Enter decodes, Ctrl+V pastes, Ctrl+C copies, Esc closes
+            if key == KEY_ESC:
+                set_decoder(False)
+            elif key in (KEY_ENTER, KEY_KPENTER):
+                run_decoder(overlay.rect_of("dec_run"))
+            elif key == KEY_V and win.xkb.ctrl():
+                paste_decoder(overlay.rect_of("dec_run"))
+            elif key == KEY_C and win.xkb.ctrl():
+                copy_decoder(overlay.rect_of("dec_copy"))
+            elif key == KEY_BACKSPACE and view["dec_draft"]:
+                d = view["dec_draft"]
+                view["dec_draft"] = d.rstrip().rpartition(" ")[0] if win.xkb.ctrl() else d[:-1]
+                view["dirty"] = True
             return
         if view["cal_open"]:  # typing a reminder title: Enter saves, Esc closes
             if key == KEY_ESC:
@@ -1101,7 +1640,11 @@ def main():
                 view["dirty"] = True
             return
 
-        if key == KEY_ESC:  # the only quit key, shown in the footer
+        if key == KEY_ESC and view["pr_open"]:  # closes the comments card first
+            set_prs(False)
+        elif key == KEY_ESC and view["set_open"]:
+            set_settings(False)
+        elif key == KEY_ESC:  # the only quit key, shown in the footer
             win.closed = True
         elif key == KEY_BACKSPACE:
             toggle_move(None)
@@ -1194,6 +1737,8 @@ def main():
             elif kind == "run":
                 view["voice_text"] = f"\u201c{view['voice_heard']}\u201d: {ev[2]}  ($ {ev[1]})"
                 view["voice_until"] = now + 6
+                if meta.get("kind") == "open":  # its window goes to your monitor too
+                    mover.expect(app_output(), seconds=15, lookback=4)  # it may have opened already
                 if meta.get("kind") in ("open", "close"):
                     speaker.react(meta["kind"], app=meta.get("app"))
                 else:  # learned/AI commands: their "say" may be in another language than her voice
@@ -1260,13 +1805,14 @@ def main():
         busy = max(r.env for r in routines)
         if view["hand"] > 0.001:
             model.SetParamById(RAISE_HAND_PARAM, 1.0, view["hand"] * (1.0 - busy))
-        shown = (dancer.active, poser.label(), walker.active, greeter.active)
+        shown = (dancer.active, poser.label(), walker.active, greeter.active, thinker.active, huh.active)
         mw, mh = view["size"]
         box = view["body_box"]  # stroll room: the free width beside her, in offset units
         room = max(0.0, (mw - (box[1] - box[0])) / 2 - 8) / (max(mw, mh) / 2) if box else 0.0
         dance, pose, walk, greet = dancer.update(dt), poser.update(dt), walker.update(dt, room), greeter.update(dt)
+        think, puzzled = thinker.update(dt), huh.update(dt)
         shift_x = shift_y = 0.0
-        for params in (dance and dance[0], pose, walk and walk[0], greet):
+        for params in (dance and dance[0], pose, walk and walk[0], greet, think, puzzled):
             for param, (value, weight) in (params or {}).items():
                 model.SetParamById(param, value, weight)
         if dance:
@@ -1279,7 +1825,7 @@ def main():
         if view["was_moving"] and not moving:  # back at rest: measure her real outline again
             refresh_silhouette(0.1)
         view["was_moving"] = moving
-        if (dancer.active, poser.label(), walker.active, greeter.active) != shown:
+        if (dancer.active, poser.label(), walker.active, greeter.active, thinker.active, huh.active) != shown:
             view["dirty"] = True  # button states / pose label changed
             view["region_dirty"] = True
         # Simulated talking: drive the mouth, plus a gentle head sway while she speaks.
@@ -1346,6 +1892,103 @@ def main():
             view["pose_seen"] = poser.label()
             if poser.label():
                 effects.flash(hx + 60, hy + 40)
+        # Agent apps: each one's icon floats by her head while the app is open, its dots
+        # circling while an agent works there. While one waits on you she goes 'huh?' at its
+        # icon (whenever she is free); otherwise, while any works, she thinks it over looking
+        # at its icon; when the last one is done she gets it.
+        working, waiting = [], []
+        for app in agent_apps:
+            is_open, doing = app.poll(now)
+            badge = badges.get(app.name)
+            if is_open and not badge:
+                badge = badges[app.name] = effects.badge(app.icon, lambda side=app.side: agent_spot(side))
+            elif not is_open and badge:
+                badge.leave()
+                badge = badges.pop(app.name) and None
+            if badge:
+                if badge.working and doing not in (WORKING, WAITING):  # this one is done
+                    effects.kira(*agent_spot(app.side), r=12, life=0.7)
+                badge.working, badge.waiting = doing in (WORKING, WAITING), doing == WAITING
+            if doing == WORKING:
+                working.append(app.side)
+            elif doing == WAITING:
+                waiting.append(app.side)
+        view["agents_working"], view["agents_waiting"] = bool(working), bool(waiting)
+        if waiting:
+            if huh.active and huh.side not in waiting:
+                huh.side = waiting[0]
+            free = not any(r.active for r in routines if r is not thinker) and not view["huh_dismissed"]
+            if free and not huh.active and (thinker.active or not any(r.active for r in routines)):
+                if thinker.active:
+                    thinker.stop(aha=False)  # not done: it needs you
+                huh.side = waiting[0]
+                toggle_routine(huh)
+                view["agents_huh"] = True
+        elif view["agents_huh"] or view["huh_dismissed"]:
+            if view["agents_huh"] and huh.active:
+                toggle_routine(huh)  # answered: she relaxes (and thinks again if it works on)
+            view.update(agents_huh=False, huh_dismissed=False)
+        # PR review: Kiro was asked to open the repo with the review prompt (or it failed).
+        outcome = reviewer.poll()
+        if outcome:
+            ok, message = outcome
+            view.update(pk_status=message, dirty=True)
+            if ok:
+                view["pk_close_at"] = now + 3.5  # time to read where the prompt went
+                effects.idea(*head(), 1)
+        if view["pk_close_at"] and now >= view["pk_close_at"]:
+            view["pk_close_at"] = None
+            set_picker(False)
+
+        # Decode: an explanation of a stack trace came back from OpenRouter.
+        answer = explainer.poll()
+        if answer:
+            text, error = answer
+            view.update(dec_explanation=text, dec_status="" if text else f"No explanation: {error}", dirty=True)
+            if view["dec_think"] and thinker.active:
+                toggle_routine(thinker)  # she gets it
+                effects.later(0.15, lambda: effects.idea(*head(), thinker.side))
+            view["dec_think"] = False
+
+        # Pull requests: gh checks every 15 minutes in the background. New comments by others
+        # bring up the GitHub badge with their count and she says what happened; the badge
+        # stays until you open the comments card (and close it again).
+        if prs.due(now):
+            prs.check(now)
+        new_comments = prs.poll()
+        if new_comments:
+            announce_prs(new_comments, now)
+        gh = badges.get("github")
+        if prs.unread and not gh:
+            gh = badges["github"] = effects.badge(str(gh_icon) if gh_icon.exists() else None, pr_spot,
+                                                  glyph=effects.pull_request)
+            view["dirty"] = True  # its click area
+        elif not prs.unread and gh:
+            gh.leave()
+            gh = badges.pop("github") and None
+            view["dirty"] = True
+        if gh:
+            gh.label, gh.waiting = len(prs.unread), now < view["gh_hop_until"]
+        if huh.beats != view["huh_beats"]:  # a double take: its little burst as the '?' pops up
+            view["huh_beats"] = huh.beats
+            effects.later(0.5, lambda: effects.puzzled(*head(), huh.side))
+        if not waiting:  # thinking waits while something needs you
+            if working:
+                if thinker.side not in working:  # the one she was looking at is done
+                    thinker.side = working[0]
+                if not view["agents_dismissed"] and not any(r.active for r in routines):
+                    thinker.side = working[0]
+                    toggle_routine(thinker)
+                    view.update(agents_think=True, next_ponder=now + 0.7)
+            elif view["agents_think"] or view["agents_dismissed"]:
+                if view["agents_think"] and thinker.active:
+                    toggle_routine(thinker)
+                    effects.later(0.15, lambda: effects.idea(*head(), thinker.side))
+                view.update(agents_think=False, agents_dismissed=False)
+        if thinker.active and now >= view["next_ponder"] and overlay.card_top is None:  # not over a card
+            view["next_ponder"] = now + 6.5
+            looking_at_icon = view["agents_think"] and working
+            effects.ponder(hx, hy, thinker.side, cloud=not looking_at_icon)  # the trail leads to the icon
         if dancer.active and now >= view["next_rumble"]:
             if view["next_rumble"]:
                 effects.rumble(hx + random.choice((-1, 1)) * 80, hy + 60)
@@ -1379,7 +2022,26 @@ def main():
                    "events": events, "due_count": view.get("due_count", 0), "yearly": view["cal_yearly"]}
             overlay_tex.upload(overlay.render(pendings, view["open"], view["draft"], talker.seconds_left(now),
                                               active, view["moves_open"], dancer.active, poser.label(),
-                                              {"walk": walker.active, "greet": greeter.active},
+                                              {"walk": walker.active, "greet": greeter.active, "huh": huh.active},
+                                              thinking=thinker.active,
+                                              prs={"open": view["pr_open"], "items": prs.unread, "skip": view["pr_skip"],
+                                                   "checked": time.strftime("%H:%M", time.localtime(prs.checked_at))
+                                                   if prs.checked_at else None},
+                                              gh_badge=pr_spot if "github" in badges else None,
+                                              dec={"open": view["dec_open"], "draft": view["dec_draft"],
+                                                   "result": view["dec_result"], "status": view["dec_status"],
+                                                   "explanation": view["dec_explanation"], "skip": view["dec_skip"],
+                                                   "clipboard": decode.has_clipboard()},
+                                              picker={"open": view["pk_open"], "step": view["pk_step"],
+                                                      "path": view["pk_path"], "entries": view["pk_entries"],
+                                                      "repo": view["pk_repo"], "branches": view["pk_branches"],
+                                                      "base": view["pk_base"], "filter": view["pk_filter"],
+                                                      "selected": view["pk_selected"], "skip": view["pk_skip"],
+                                                      "status": view["pk_status"]},
+                                              settings={"open": view["set_open"], "monitors": mover.monitors,
+                                                        "choice": state.get("app_output", "auto"),
+                                                        "largest": mover.largest(), "available": mover.available,
+                                                        "here": win.output.name if win.output else None},
                                               cal=cal, alerts=alerts(), monitor=monitor.view(view["mon_open"]),
                                               voice={"state": assistant.state, "text": view["voice_text"],
                                                      "error": view["voice_error"], "command": view["voice_command"]}))

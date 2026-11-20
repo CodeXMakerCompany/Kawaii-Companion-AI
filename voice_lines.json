@@ -49,6 +49,11 @@
 
  "reminder_today": ["Hey! Don't forget: {title}!", "Reminder time! {title}."],
  "reminder_overdue": ["Psst, this one is still waiting for you: {title}.", "Don't forget about {title}! It's still pending."],
+
+ "pr_comment": ["{who} left a comment on your {repo} pull request!", "New comment from {who} on {repo}. Wanna take a look?"],
+ "pr_comments": ["You've got {count} new comments on your pull requests!", "{count} new comments on your PRs. Someone's been busy!"],
+ "pr_approved": ["Yay! {who} approved your {repo} pull request!", "Good news! {who} approved your pull request on {repo}."],
+ "pr_changes": ["{who} asked for changes on your {repo} pull request.", "Hmm, {who} wants some changes on {repo}."],
  "alarms": {
   "cpu": "Heads up! Your CPU is working really hard.",
   "mem": "Your memory is almost full. Maybe close something?",

@@ -120,6 +120,48 @@ def read_wav(path):
     return np.frombuffer(data, np.int16).astype(np.float32) / 32768.0
 
 
+def openrouter(key_file, models, system, text, max_tokens=400, accept=None):
+    """Ask OpenRouter's free models in turn until one gives an acceptable reply; returns
+    (accepted reply, None) or (None, why not). accept(content) returns the reply to keep, or
+    None to try the next model (by default: any non-empty text). The model that answered is
+    moved to the front of `models`, so it is asked first next time."""
+    try:
+        key = Path(key_file).read_text().strip()
+    except OSError:
+        return None, f"No OpenRouter key in {key_file}"
+    accept = accept or (lambda content: content.strip() or None)
+    last_error = "AI unavailable"
+    deadline = time.monotonic() + AI_BUDGET
+    for model in list(models):
+        remaining = deadline - time.monotonic()
+        if remaining < 2:
+            last_error += " (gave up: free models too slow right now)"
+            break
+        body = {"model": model, "temperature": 0, "max_tokens": max_tokens,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}]}
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions", data=json.dumps(body).encode(),
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                     "X-Title": "shark-viewer"})
+        try:
+            with urllib.request.urlopen(req, timeout=min(AI_TIMEOUT, remaining)) as resp:
+                content = json.load(resp)["choices"][0]["message"].get("content") or ""
+        except urllib.error.HTTPError as e:  # 429 rate limit, 5xx, ...: try the next free model
+            last_error = f"{model}: HTTP {e.code}"
+            continue
+        except (urllib.error.URLError, TimeoutError, KeyError, ValueError) as e:
+            last_error = f"{model}: {e}"
+            continue
+        reply = accept(content)
+        if reply is None:  # some free models answer with an empty or malformed message
+            last_error = f"{model}: unusable reply"
+            continue
+        models.remove(model)
+        models.insert(0, model)  # it works: ask it first next time
+        return reply, None
+    return None, last_error
+
+
 class VoiceAssistant:
     """States: idle -> listening -> thinking -> (confirm) -> idle. Events from poll():
     ("status", text[, meta]), ("heard", text), ("run", command, say, meta), ("confirm", command, say),
@@ -336,10 +378,6 @@ class VoiceAssistant:
 
     def _ask_ai(self, text):
         """Ask OpenRouter's free models for one shell command; returns (command|None, say)."""
-        try:
-            key = self.key_file.read_text().strip()
-        except OSError:
-            return None, f"No OpenRouter key in {self.key_file}"
         system = (
             "You turn a spoken request (English or Spanish) into ONE Linux shell command for Pop!_OS 24.04 "
             "with the COSMIC desktop (Wayland). Reply with JSON only, no prose: "
@@ -348,39 +386,15 @@ class VoiceAssistant:
             "folders. To close an app use pkill -o -x <process-name> (graceful, no -9) or flatpak kill <app-id>. "
             "Never use sudo, rm, dd, mkfs, shutdown, reboot, kill -9 or anything destructive. "
             "Installed desktop ids: " + ", ".join(desktop_ids()))
-        last_error = "AI unavailable"
-        deadline = time.monotonic() + AI_BUDGET
-        for model in list(self.models):
-            remaining = deadline - time.monotonic()
-            if remaining < 2:
-                last_error += " (gave up: free models too slow right now)"
-                break
-            body = {"model": model, "temperature": 0, "max_tokens": 400,
-                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}]}
-            req = urllib.request.Request(
-                "https://openrouter.ai/api/v1/chat/completions", data=json.dumps(body).encode(),
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                         "X-Title": "shark-viewer"})
-            try:
-                with urllib.request.urlopen(req, timeout=min(AI_TIMEOUT, remaining)) as resp:
-                    content = json.load(resp)["choices"][0]["message"].get("content") or ""
-            except urllib.error.HTTPError as e:  # 429 rate limit, 5xx, ...: try the next free model
-                last_error = f"{model}: HTTP {e.code}"
-                continue
-            except (urllib.error.URLError, TimeoutError, KeyError, ValueError) as e:
-                last_error = f"{model}: {e}"
-                continue
+
+        def json_reply(content):
             match = re.search(r"\{.*\}", content, re.S)
-            if not content.strip() or not match:  # some free models answer with an empty message
-                last_error = f"{model}: no JSON in reply"
-                continue
             try:
-                answer = json.loads(match.group(0))
+                return json.loads(match.group(0)) if match else None
             except ValueError:
-                last_error = f"{model}: bad JSON"
-                continue
-            self.models.remove(model)
-            self.models.insert(0, model)  # it works: ask it first next time
-            command = (answer.get("command") or "").strip() or None
-            return command, str(answer.get("say") or "")
-        return None, last_error
+                return None
+        answer, error = openrouter(self.key_file, self.models, system, text, accept=json_reply)
+        if answer is None:
+            return None, error
+        command = (answer.get("command") or "").strip() or None
+        return command, str(answer.get("say") or "")

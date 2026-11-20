@@ -196,14 +196,19 @@ class Effects:
         self.bounds = (0, 0)  # window size; nothing is drawn outside it
         self._words = {}
         self._dots = None
+        self._icons = {}
 
     @property
     def busy(self):
-        return bool(self.live or self.timers)
+        """Something short-lived is playing (worth 60 fps); floating badges alone are not."""
+        return bool(self.timers) or any(e[1] != math.inf for e in self.live)
 
     def add(self, life, draw):
+        """Returns the effect's entry ([elapsed, life, draw]), or None when effects are off."""
         if self.enabled:
             self.live.append([0.0, life, draw])
+            return self.live[-1]
+        return None
 
     def later(self, seconds, fn):
         if self.enabled:
@@ -476,6 +481,166 @@ class Effects:
             ctx.stroke()
         self.add(life, draw)
 
+    # ───────── floating badges ─────────
+
+    def _icon(self, path, size):
+        """An image file as a cairo surface, scaled once to `size` px (twice that, for sharpness)."""
+        key = (path, size)
+        if key not in self._icons:
+            from PIL import Image
+            img = Image.open(path).convert("RGBA")
+            img = img.crop(img.getchannel("A").getbbox() or (0, 0, *img.size))  # no transparent margin
+            img = img.convert("RGBa").resize((size * 2, size * 2), Image.LANCZOS)  # premultiplied
+            r, g, b, a = img.split()
+            data = bytearray(Image.merge("RGBA", (b, g, r, a)).tobytes())  # cairo wants BGRA
+            surface = cairo.ImageSurface.create_for_data(data, cairo.FORMAT_ARGB32, size * 2, size * 2)
+            self._icons[key] = (surface, data)  # the surface draws from data: keep both alive
+        return self._icons[key][0]
+
+    def badge(self, path, place, size=40, glyph=None):
+        """An app icon floating where place() says (window coords, read every frame) until
+        leave(): it pops in on a spring, bobs and rocks, and shrinks away in a puff. While its
+        .working is set, three dots spring out and circle it; while .waiting is set (it waits
+        on you) it hops like a notification with a pink '?' on its corner, or with .label
+        there instead (a count) whenever that is set. The icon sits in a white, inked frame
+        like the buttons. glyph(ctx, size) draws the icon when there is no image file."""
+        surface = self._icon(path, size) if path else None
+        pop, dots, last, gone = Spring(0.0, 380, 13), Spring(0.0, 300, 16), [0.0], [False]
+        ask, hop = Spring(0.0, 420, 14), [0.0]  # the '?' badge; seconds into the hop cycle
+        pop.to = 1.0
+        spin = [0.0]  # the dots' angle: only moves while working
+        half, rad = size / 2, size * 0.26
+        badge = None  # set below; draw reads its .working
+
+        def frame(ctx, x, y, w, r):
+            ctx.new_sub_path()
+            for cx, cy, a in ((x + w - r, y + r, -math.pi / 2), (x + w - r, y + w - r, 0),
+                              (x + r, y + w - r, math.pi / 2), (x + r, y + r, math.pi)):
+                ctx.arc(cx, cy, r, a, a + math.pi / 2)
+            ctx.close_path()
+
+        def draw(ctx, k, t):
+            dt = t - last[0]
+            last[0] = t
+            s = pop.step(dt)
+            dots.to = 1.0 if badge.working and not badge.waiting and not gone[0] else 0.0
+            d = max(0.0, dots.step(dt))
+            if badge.working:
+                spin[0] += dt * 2.4
+            ask.to = 1.0 if (badge.waiting or badge.label) and not gone[0] else 0.0
+            q = max(0.0, ask.step(dt))
+            jump = squash = 0.0
+            if badge.waiting:  # a hop every 1.6 s: up, down, a squash on landing
+                hop[0] = (hop[0] + dt) % 1.6
+                h = hop[0] / 0.42
+                if h < 1:
+                    jump = math.sin(math.pi * h) * 11
+                elif h < 1.5:
+                    squash = math.sin(math.pi * (h - 1) / 0.5) * 0.12
+            else:
+                hop[0] = 0.0
+            if s <= 0.01:
+                return
+            x, y = place()
+            ctx.translate(x, y + math.sin(t * 2.1) * 4 - jump)
+            ctx.rotate(math.sin(t * 1.3) * 0.08 + (math.sin(t * 9) * 0.06 if jump else 0))
+            ctx.scale(s * (1 + squash), s * (1 - squash))
+            e = 3  # the white rim
+            frame(ctx, -half - e + 3.5, -half - e + 4.5, size + 2 * e, rad + e)  # hard shadow
+            ctx.set_source_rgb(*SHADE)
+            ctx.fill()
+            frame(ctx, -half - e, -half - e, size + 2 * e, rad + e)
+            ctx.set_source_rgb(*FILL)
+            ctx.fill_preserve()
+            ctx.set_source_rgb(*INK)
+            ctx.set_line_width(2.4)
+            ctx.stroke()
+            if surface:
+                ctx.save()
+                frame(ctx, -half, -half, size, rad)
+                ctx.clip()
+                ctx.translate(-half, -half)
+                ctx.scale(0.5, 0.5)
+                ctx.set_source_surface(surface, 0, 0)
+                ctx.get_source().set_filter(cairo.FILTER_GOOD)
+                ctx.paint()
+                ctx.restore()
+            elif glyph:
+                ctx.save()
+                frame(ctx, -half, -half, size, rad)
+                ctx.clip()
+                glyph(ctx, size)
+                ctx.restore()
+            if d > 0.02:  # working: three dots circling it
+                for i in range(3):
+                    a = spin[0] + i * TAU / 3
+                    ctx.new_sub_path()
+                    ctx.arc(math.cos(a) * (half + 12) * d, math.sin(a) * (half + 12) * 0.8 * d, 3.2 * min(1.0, d),
+                            0, TAU)
+                ctx.set_source_rgb(*FILL)
+                ctx.fill_preserve()
+                ctx.set_source_rgb(*LINE)
+                ctx.set_line_width(1.6)
+                ctx.stroke()
+            if q > 0.02:  # waiting on you: a pink '?' (or the label) on the top-right corner, pulsing
+                text = str(badge.label or "?")
+                ctx.save()
+                ctx.translate(half + 1, -half - 1)
+                ctx.scale(q * (1 + 0.08 * math.sin(t * 6)), q * (1 + 0.08 * math.sin(t * 6)))
+                ctx.arc(0, 0, 10 + 3.5 * (len(text) - 1), 0, TAU)
+                ctx.set_source_rgb(*PINK)
+                ctx.fill_preserve()
+                ctx.set_source_rgb(*INK)
+                ctx.set_line_width(2.2)
+                ctx.stroke()
+                ctx.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+                ctx.set_font_size(14)
+                xb, yb, w, h = ctx.text_extents(text)[:4]
+                ctx.move_to(-w / 2 - xb, -h / 2 - yb)
+                ctx.set_source_rgb(*FILL)
+                ctx.show_text(text)
+                ctx.restore()
+        entry = self.add(math.inf, draw)
+
+        class Badge:
+            working = False
+            waiting = False
+            label = None
+
+            def leave(_):
+                if entry and not gone[0]:
+                    gone[0] = True
+                    pop.to, pop.k = 0.0, 520
+                    entry[1] = entry[0] + 0.45
+                    self.puff(*place(), n=5, size=11, life=0.6)
+        badge = Badge()
+        return badge
+
+    @staticmethod
+    def pull_request(ctx, size):
+        """A pull-request symbol (two commits, the branch merging back with an arrow) in white
+        on ink, for the GitHub badge when there is no icon file."""
+        ctx.set_source_rgb(*INK)
+        ctx.paint()
+        u = size / 40
+        ctx.set_source_rgb(*FILL)
+        ctx.set_line_width(3 * u)
+        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+        ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+        for cx, cy in ((-9, -10), (-9, 10), (9, 10)):  # the commits
+            ctx.new_sub_path()
+            ctx.arc(cx * u, cy * u, 3.6 * u, 0, TAU)
+        ctx.move_to(-9 * u, -6.4 * u)  # the base branch
+        ctx.line_to(-9 * u, 6.4 * u)
+        ctx.move_to(9 * u, 6.4 * u)  # the change, coming back into it
+        ctx.line_to(9 * u, -4 * u)
+        ctx.curve_to(9 * u, -8 * u, 7 * u, -10 * u, 3 * u, -10 * u)
+        ctx.line_to(-1 * u, -10 * u)
+        ctx.move_to(2.5 * u, -13.5 * u)  # the arrowhead
+        ctx.line_to(-1 * u, -10 * u)
+        ctx.line_to(2.5 * u, -6.5 * u)
+        ctx.stroke()
+
     # ───────── the lettering ─────────
 
     def _word(self, name):
@@ -687,6 +852,30 @@ class Effects:
         self.puff(x - 20, y, size=7, n=4, vx=-24, vy=-8, life=0.7)
         self.puff(x + 20, y, size=6, n=3, vx=24, vy=-8, life=0.6)
         self.sfx("zuza", x + 50, y - 50, size=90, rot=-0.1, style="dotted")
+
+    def ponder(self, x, y, side=1, cloud=True):
+        """Thinking: a trail of little clouds rising up and away from her head into a bigger
+        one, like a manga thought bubble. x, y: top centre of her head; side: 1 to the right,
+        -1 to the left. cloud=False leaves the end of the trail free for something floating there."""
+        trail = ((x + side * 52, y + 34, 3.2), (x + side * 70, y + 10, 4.6), (x + side * 92, y - 14, 6.2))
+        for i, (px, py, size) in enumerate(trail):
+            self.later(i * 0.22, lambda px=px, py=py, size=size, life=1.9 - i * 0.2: self.puff(
+                px, py, n=3, size=size, vx=side * 4, vy=-6, life=life, spread=0.6))
+        if cloud:
+            self.later(0.7, lambda: self.puff(x + side * 124, y - 44, n=7, size=12, vx=side * 6, vy=-8, life=1.6,
+                                              spread=1.1))
+
+    def idea(self, x, y, side=1):
+        """Got it: a glint by her head, a fan of wedges, a smaller glint after."""
+        self.kira(x + side * 40, y - 6, r=13, life=0.8)
+        self.ticks(x + side * 40, y - 6, dir=-math.pi / 2, n=5, r=16, len=12, fan=0.42, life=0.5)
+        self.later(0.15, lambda: self.kira(x + side * 64, y + 18, r=7, life=0.55))
+
+    def puzzled(self, x, y, side=1):
+        """A double take ('huh?'): wedges flying off where the '?' pops up by her head, and
+        wobble marks on the side she cocks her head to. x, y: top centre of her head."""
+        self.ticks(x + 56, y + 6, dir=-1.0, n=3, r=10, len=13, fan=0.45, life=0.45)
+        self.wob(x + side * 62, y + 46, dir=side, r=12, life=0.5)
 
     def nudge(self, rect):
         """Get attention: wedges off a corner and wobble marks at both sides."""
