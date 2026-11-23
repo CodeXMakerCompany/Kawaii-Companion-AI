@@ -45,6 +45,9 @@
  "no_command": ["I couldn't find a command for that, sorry!", "Hmm, I'm not sure how to do that one."],
  "ai_down": ["My AI helpers are busy right now. Let's try again in a bit!"],
  "cancelled": ["Okay, I won't run it.", "Cancelled! No worries."],
+ "confirm_command": ["Are you sure? Say yes and I'll do it.", "Really? Say yes, or press Run."],
+ "confirm_poweroff": ["Turn off the PC? Say yes and I'll shut it down.", "Leaving already? Say yes and I'll turn it off."],
+ "poweroff": ["Okay, shutting down. Good night!", "Bye bye! Turning off the PC.", "See you next time! Shutting down now."],
  "greet": ["Hi there! It's so nice to see you!", "Hello hello! What are we doing today?", "Hey! I'm right here if you need me."],
 
  "reminder_today": ["Hey! Don't forget: {title}!", "Reminder time! {title}."],
@@ -54,6 +57,7 @@
  "pr_comments": ["You've got {count} new comments on your pull requests!", "{count} new comments on your PRs. Someone's been busy!"],
  "pr_approved": ["Yay! {who} approved your {repo} pull request!", "Good news! {who} approved your pull request on {repo}."],
  "pr_changes": ["{who} asked for changes on your {repo} pull request.", "Hmm, {who} wants some changes on {repo}."],
+ "endpoint_down": ["Uh oh! {title} isn't answering.", "Heads up! {title} looks down.", "Hmm, {title} stopped responding."],
  "alarms": {
   "cpu": "Heads up! Your CPU is working really hard.",
   "mem": "Your memory is almost full. Maybe close something?",

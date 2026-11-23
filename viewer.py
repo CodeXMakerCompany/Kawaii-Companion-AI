@@ -75,6 +75,7 @@ sys.path.insert(0, str(HERE))  # run.sh uses python -I, which leaves the script 
 from fx import Effects, Press
 from agents import WAITING, WATCHERS, WORKING
 from prwatch import PRWatcher
+from observe import Pinger
 import decode
 import prreview
 from winmove import WindowMover
@@ -100,7 +101,8 @@ TALK_SECONDS = 10
 CLICKABLE = ("button", "item", "move", "moves_toggle", "action", "cal_prev", "cal_next", "cal_day", "cal_save",
              "cal_new", "cal_delete", "cal_event", "cal_done", "cal_yearly", "alert_action", "monitor_toggle",
              "mic", "voice_run", "voice_cancel", "gh_badge", "dec_paste", "dec_run", "dec_clear", "dec_copy",
-             "dec_explain", "pk_row", "pk_back", "pk_open", "pk_cancel", "set_mon", "set_done")
+             "dec_explain", "pk_row", "pk_back", "pk_open", "pk_cancel", "set_mon", "set_done",
+             "obs_add", "obs_paste", "obs_check", "obs_done", "obs_row", "obs_input", "obs_title_in")
 
 MIN_MODEL, MAX_MODEL = (300, 360), (1600, 2200)  # her area, in px
 SILHOUETTE_BAND = 24  # px; input-region rows follow her outline in bands this tall
@@ -109,7 +111,7 @@ FIT_PAD = 0.03  # space left around her when fitting, as a fraction of the area
 
 # evdev key codes (layout independent, like VTube Studio's hotkeys)
 KEY_ESC, KEY_BACKSPACE, KEY_ENTER, KEY_KPENTER, KEY_R, KEY_F10 = 1, 14, 28, 96, 19, 68
-KEY_C, KEY_V = 46, 47
+KEY_C, KEY_V, KEY_TAB = 46, 47, 15
 _KP = {1: 79, 2: 80, 3: 81, 4: 75, 5: 76, 6: 77, 7: 71, 8: 72, 9: 73, 0: 82}
 _FKEYS = {1: 59, 2: 60, 3: 61, 4: 62, 5: 63, 6: 64, 7: 65, 8: 66, 9: 67, 10: 68, 11: 87, 12: 88}
 
@@ -838,13 +840,7 @@ def main():
     thinker = Thinker()
     huh = Huh()
     routines = (dancer, poser, walker, greeter, thinker, huh)  # each drives her whole body: one at a time
-    moves_file = HERE / "moves.json"  # labelled, grouped mini buttons; falls back to raw names
-    if moves_file.exists():
-        move_groups = json.loads(moves_file.read_text(encoding="utf-8"))["groups"]
-    else:
-        move_groups = [{"name": "Moves", "moves": [[exp, exp] for exp in sorted(set(hotkeys.values()))]}]
-    overlay = Overlay(model_w, model_h, 1.0, left)
-    overlay.moves = move_groups
+    overlay = Overlay(model_w, model_h, 1.0, left)  # the Moves grid (moves.json) is hidden; hotkeys still toggle them
     overlay_tex = OverlayTexture(win.width, win.height)
     monitor_tex = OverlayTexture(1, 1)  # the monitor's own small layer: its numbers change every 2s
     effects = Effects(enabled=not args.no_fx and animations_enabled())
@@ -853,6 +849,7 @@ def main():
     agent_apps = [W() for W in WATCHERS]  # Kiro, Claude
     badges = {}  # app name -> its floating icon, while the app is open
     prs = PRWatcher(CONFIG_DIR / "prwatch.json")
+    pinger = Pinger(CONFIG_DIR / "observe.json")  # the Observability endpoints
     gh_icon = CONFIG_DIR / "github.png"  # optional: your own GitHub icon; a pull-request symbol otherwise
     reviewer = prreview.Reviewer()
     mover = WindowMover()  # puts the windows of apps she opens on the monitor you chose
@@ -882,7 +879,8 @@ def main():
         "mon_open": state.get("monitor_open", False),
         "voice_text": None,  # banner text
         "voice_error": False,
-        "voice_command": None,  # AI suggestion waiting for Run/Cancel
+        "voice_command": None,  # AI suggestion (or a "confirm" command like power off) waiting for Run/Cancel
+        "voice_ai": False,  # that command came from the AI (approving it teaches it)
         "voice_until": None,  # hide the banner after this time
         "voice_heard": "",
         "voice_toggle": False,  # set by SIGUSR1 (global shortcut script)
@@ -937,6 +935,12 @@ def main():
         "pk_status": "",
         "pk_close_at": None,  # the picker closes itself after a review was handed to Kiro
         "set_open": False,  # the Settings card
+        "obs_open": False,  # the Observability card
+        "obs_draft": "",  # the URL being typed
+        "obs_title": "",  # its title
+        "obs_focus": "title",  # which field typing goes to: title or url
+        "obs_status": "",  # a short note: Copied!, why paste failed
+        "obs_skip": 0,  # endpoint rows scrolled past
         "gh_hop_until": 0.0,  # the GitHub badge hops until then (new comments just came in)
         "walk_x": 0.0,
         "banner_shown": False,
@@ -1012,7 +1016,7 @@ def main():
     def set_open(on):
         if on:
             pendings.roll_day()
-            view["cal_open"] = view["dec_open"] = view["pk_open"] = view["set_open"] = False  # one card at a time
+            view["cal_open"] = view["dec_open"] = view["pk_open"] = view["set_open"] = view["obs_open"] = False  # one card at a time
             set_prs(False)
         view["open"] = on
         view["dirty"] = True
@@ -1022,7 +1026,7 @@ def main():
         if on:
             set_open(False)
             set_prs(False)
-            view["dec_open"] = view["pk_open"] = view["set_open"] = False
+            view["dec_open"] = view["pk_open"] = view["set_open"] = view["obs_open"] = False
             today = datetime.date.today()
             if not view["cal_editing"]:
                 view["cal_month"], view["cal_selected"] = (today.year, today.month), today.isoformat()
@@ -1034,21 +1038,75 @@ def main():
         """The pull-request comments card; closing it marks them read (and the badge goes)."""
         if on:
             view["open"] = view["cal_open"] = view["dec_open"] = view["pk_open"] = view["set_open"] = False
+            view["obs_open"] = False
         elif view["pr_open"]:
             prs.mark_read()
         view.update(pr_open=on, pr_skip=0, dirty=True)
 
     def set_decoder(on):
         if on:
-            view["open"] = view["cal_open"] = view["pk_open"] = view["set_open"] = False  # one card at a time
+            view["open"] = view["cal_open"] = view["pk_open"] = view["set_open"] = view["obs_open"] = False  # one card at a time
             set_prs(False)
         view.update(dec_open=on, dirty=True)
 
     def set_settings(on):
         if on:
-            view["open"] = view["cal_open"] = view["dec_open"] = view["pk_open"] = False  # one card at a time
+            view["open"] = view["cal_open"] = view["dec_open"] = view["pk_open"] = view["obs_open"] = False  # one card at a time
             set_prs(False)
         view.update(set_open=on, dirty=True)
+
+    def set_observe(on):
+        if on:
+            view["open"] = view["cal_open"] = view["dec_open"] = view["pk_open"] = view["set_open"] = False  # one card at a time
+            set_prs(False)
+        view.update(obs_open=on, obs_skip=0, obs_focus="title", obs_status="", dirty=True)
+
+    def add_endpoint(rect=None):
+        if not view["obs_draft"].strip():
+            view.update(obs_focus="url", obs_status="Type the URL too", dirty=True)
+            return
+        if pinger.add(view["obs_draft"], view["obs_title"]):
+            view.update(obs_draft="", obs_title="", obs_focus="title", obs_status="")
+            if rect:
+                effects.done(rect)
+        else:
+            view["obs_status"] = "That URL is already watched"
+        view["dirty"] = True
+
+    def paste_endpoint(rect=None):
+        """Into the field being typed in (a URL keeps only its first word)."""
+        if not decode.has_clipboard():
+            view.update(obs_status="Install wl-clipboard to copy and paste", dirty=True)
+            return
+        text = (decode.clipboard_get() or "").strip()
+        if not text:
+            view.update(obs_status="The clipboard has no text", dirty=True)
+            return
+        if view["obs_focus"] == "url":
+            view["obs_draft"] += text.split()[0]
+        else:
+            view["obs_title"] += " ".join(text.split())
+        view.update(obs_status="", dirty=True)
+
+    def copy_endpoint(index):
+        if not decode.has_clipboard():
+            view.update(obs_status="Install wl-clipboard to copy and paste", dirty=True)
+            return False
+        ok = decode.clipboard_set(pinger.endpoints[index]["url"])
+        view.update(obs_status="Copied!" if ok else "Could not copy", dirty=True)
+        return ok
+
+    def announce_down(went_down):
+        """She says which endpoint stopped answering, and the Observability button gets a nudge."""
+        e = went_down[0]
+        host = e["url"].split("://", 1)[-1].split("/")[0]
+        name = e.get("title") or host
+        said = speaker.react("endpoint_down", title=name if len(went_down) == 1 else f"{len(went_down)} endpoints")
+        if not (said and speaker.available):
+            talker.start(time.perf_counter(), 2.5)  # no voice: at least move her mouth
+        button = overlay.rect_of("button", "observe")
+        if button:
+            effects.nudge(button)
 
     def app_output():
         """The monitor apps she opens should land on: your choice, or the largest one."""
@@ -1505,6 +1563,34 @@ def main():
                 view["dirty"] = True
         elif hit == ("set_done", None) and button == BTN_LEFT:
             set_settings(False)
+        elif hit == ("button", "observe") and button == BTN_LEFT:
+            set_observe(not view["obs_open"])
+            if view["obs_open"]:
+                effects.pop(rect)
+            else:
+                effects.poof(rect[2] - 16, (rect[1] + rect[3]) / 2)
+        elif hit and hit[0] in ("obs_add", "obs_paste", "obs_check", "obs_done") and button == BTN_LEFT:
+            presses[hit] = Press()
+            if hit[0] == "obs_add":
+                add_endpoint(rect)
+            elif hit[0] == "obs_paste":
+                paste_endpoint(rect)
+            elif hit[0] == "obs_check":
+                pinger.next_check = 0.0  # the main loop starts the round
+                effects.pick(rect)
+                view["dirty"] = True
+            else:
+                set_observe(False)
+        elif hit and hit[0] == "obs_row" and button == BTN_RIGHT:
+            effects.scrap(rect)
+            pinger.remove(hit[1])
+            overlay.hover = None
+            view["dirty"] = True
+        elif hit and hit[0] == "obs_row" and button == BTN_LEFT:
+            if copy_endpoint(hit[1]):
+                effects.pick(rect)
+        elif hit and hit[0] in ("obs_title_in", "obs_input") and button == BTN_LEFT:
+            view.update(obs_focus="title" if hit[0] == "obs_title_in" else "url", dirty=True)
         elif hit == ("action", "review") and button == BTN_LEFT:
             set_picker(not view["pk_open"])
             if view["pk_open"]:
@@ -1525,7 +1611,7 @@ def main():
             if view["pr_open"]:
                 effects.pick(rect)
         elif hit and hit[0] in ("card", "cal_card", "cal_input", "alert", "monitor_panel", "voice_banner", "pr_card",
-                                "dec_card", "dec_input", "pk_card", "pk_filter", "set_card"):
+                                "dec_card", "dec_input", "pk_card", "pk_filter", "set_card", "obs_card"):
             pass  # clicking a card just keeps keyboard focus here (no drag)
         elif button == BTN_LEFT:
             kind = hit[1] if hit and hit[0] == "handle" else "move"
@@ -1539,6 +1625,9 @@ def main():
             return
         if view["dec_open"] and overlay.hit(*view["mouse"]) in (("dec_card", None), ("dec_input", None)):
             view.update(dec_skip=max(0, min(view["dec_skip"] - steps, overlay.dec_rows - 1)), dirty=True)
+            return
+        if view["obs_open"] and (overlay.hit(*view["mouse"]) or ("",))[0] in ("obs_card", "obs_row", "obs_input"):
+            view.update(obs_skip=max(0, min(view["obs_skip"] - steps, overlay.obs_rows - 1)), dirty=True)
             return
         if view["pr_open"] and overlay.hit(*view["mouse"]) in (("pr_card", None), ("gh_badge", None)):
             skip = max(0, min(view["pr_skip"] - steps, overlay.pr_rows - 1))  # wheel down: further down the list
@@ -1557,6 +1646,15 @@ def main():
                 matches = [b for b, _ in view["pk_branches"] if view["pk_filter"].lower() in b.lower()]
                 if matches and view["pk_selected"] not in matches:
                     view["pk_selected"] = matches[0]
+            return
+        if view["obs_open"]:
+            typed = "".join(c for c in text if c.isprintable())  # Ctrl+letters arrive as control characters
+            if view["obs_focus"] == "url":
+                typed = "".join(typed.split())  # URLs have no spaces
+            if typed:
+                key = "obs_draft" if view["obs_focus"] == "url" else "obs_title"
+                view[key] += typed
+                view["dirty"] = True
             return
         if view["dec_open"]:
             typed = "".join(c for c in text if c.isprintable())  # Ctrl+letters arrive as control characters
@@ -1592,6 +1690,27 @@ def main():
                     view.update(pk_step="folder", pk_status="", dirty=True)
                 elif view["pk_path"] != Path.home():
                     browse(view["pk_path"].parent)
+            return
+        if view["obs_open"]:  # Tab switches field, Enter adds (from Title: goes to URL), Ctrl+V pastes, Esc closes
+            field = "obs_draft" if view["obs_focus"] == "url" else "obs_title"
+            if key == KEY_ESC:
+                set_observe(False)
+            elif key == KEY_TAB:
+                view.update(obs_focus="url" if view["obs_focus"] == "title" else "title", dirty=True)
+            elif key in (KEY_ENTER, KEY_KPENTER):
+                if view["obs_focus"] == "title" and not view["obs_draft"].strip():
+                    view.update(obs_focus="url", dirty=True)
+                else:
+                    add_endpoint(overlay.rect_of("obs_add"))
+            elif key == KEY_V and win.xkb.ctrl():
+                paste_endpoint()
+            elif key == KEY_C and win.xkb.ctrl():
+                hit = overlay.hit(*view["mouse"])
+                if hit and hit[0] == "obs_row":
+                    copy_endpoint(hit[1])
+            elif key == KEY_BACKSPACE and view[field]:
+                view[field] = view[field].rstrip().rpartition(" ")[0] if win.xkb.ctrl() else view[field][:-1]
+                view["dirty"] = True
             return
         if view["dec_open"]:  # Enter decodes, Ctrl+V pastes, Ctrl+C copies, Esc closes
             if key == KEY_ESC:
@@ -1724,7 +1843,9 @@ def main():
         for ev in assistant.poll():
             kind = ev[0]
             meta = ev[-1] if isinstance(ev[-1], dict) else {}
-            view.update(voice_error=False, voice_command=None, voice_until=None, dirty=True)
+            view.update(voice_error=False, voice_until=None, dirty=True)
+            if assistant.state != "confirm":  # a "didn't catch that" while she waits keeps Run/Cancel
+                view["voice_command"] = None
             if assistant.state == "listening":
                 speaker.stop()  # never record her own voice
             if kind == "status":
@@ -1742,13 +1863,17 @@ def main():
                 if meta.get("kind") in ("open", "close"):
                     speaker.react(meta["kind"], app=meta.get("app"))
                 else:  # learned/AI commands: their "say" may be in another language than her voice
-                    speaker.react("ran")
+                    speaker.react(meta.get("react") or "ran")  # e.g. "poweroff": she says goodbye
                 if not speaker.available:
                     talker.start(now, 2)
             elif kind == "confirm":
-                view["voice_text"] = f"AI suggests for \u201c{view['voice_heard']}\u201d: {ev[2]}".rstrip(": ")
-                view["voice_command"] = ev[1]
-                speaker.react("confirm_ai")  # "I found this command. Wanna check it first?"
+                view.update(voice_command=ev[1], voice_ai=meta.get("kind") == "ai")
+                if view["voice_ai"]:
+                    view["voice_text"] = f"AI suggests for \u201c{view['voice_heard']}\u201d: {ev[2]}".rstrip(": ")
+                    speaker.react("confirm_ai")  # "I found this command. Wanna check it first?"
+                else:  # a command.json entry marked "confirm", like turning the PC off
+                    view["voice_text"] = f"\u201c{view['voice_heard']}\u201d: {ev[2]}?"
+                    speaker.react(f"confirm_{meta['react']}" if meta.get("react") else "confirm_command")
                 if not speaker.available:
                     talker.start(now, 1.5)
             elif kind == "error":
@@ -1969,6 +2094,16 @@ def main():
             view["dirty"] = True
         if gh:
             gh.label, gh.waiting = len(prs.unread), now < view["gh_hop_until"]
+        # Observability: every endpoint gets a GET every 20 minutes in the background; she
+        # speaks up when one stops answering.
+        if pinger.due(now):
+            pinger.check(now)
+            view["dirty"] = True  # "checking…"
+        went_down = pinger.poll()
+        if went_down is not None:
+            view["dirty"] = True
+            if went_down:
+                announce_down(went_down)
         if huh.beats != view["huh_beats"]:  # a double take: its little burst as the '?' pops up
             view["huh_beats"] = huh.beats
             effects.later(0.5, lambda: effects.puzzled(*head(), huh.side))
@@ -2042,9 +2177,17 @@ def main():
                                                         "choice": state.get("app_output", "auto"),
                                                         "largest": mover.largest(), "available": mover.available,
                                                         "here": win.output.name if win.output else None},
+                                              observe={"open": view["obs_open"], "endpoints": pinger.endpoints,
+                                                       "draft": view["obs_draft"], "busy": pinger.busy,
+                                                       "title": view["obs_title"], "focus": view["obs_focus"],
+                                                       "status": view["obs_status"],
+                                                       "skip": view["obs_skip"],
+                                                       "checked": time.strftime("%H:%M", time.localtime(pinger.checked_at))
+                                                       if pinger.checked_at else None},
                                               cal=cal, alerts=alerts(), monitor=monitor.view(view["mon_open"]),
                                               voice={"state": assistant.state, "text": view["voice_text"],
-                                                     "error": view["voice_error"], "command": view["voice_command"]}))
+                                                     "error": view["voice_error"], "command": view["voice_command"],
+                                                     "ai": view["voice_ai"]}))
             view["dirty"] = False
             view["region_dirty"] = True  # card size or handles may have changed
             banner = overlay.rect_of("voice_banner")

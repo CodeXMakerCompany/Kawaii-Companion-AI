@@ -5,6 +5,8 @@ or ask OpenRouter (free models) for anything unknown.
 AI-suggested commands are never run blind: they come back as a "confirm" event. Once the
 user approves one and it runs successfully, it is saved into commands.json next to the
 built-in ones, so it runs directly from then on. Destructive commands are refused.
+Entries marked "confirm" in commands.json (turning the PC off) ask the same way. A confirm
+can be answered by voice too: "yes"/"sí" runs it, "no"/"cancela" cancels it.
 
 All slow work (model load, transcription, HTTP) happens on one worker thread; the UI
 reads results with poll().
@@ -75,6 +77,21 @@ FILLER = {"el", "la", "los", "las", "lo", "the", "a", "an", "un", "una", "please
 def core(phrase):
     """Drop articles and polite filler so 'cierra el slack por favor' matches 'cierra slack'."""
     return " ".join(w for w in phrase.split() if w not in FILLER)
+
+
+YES = {"yes", "yeah", "yep", "sure", "ok", "okay", "confirm", "run", "do", "it", "go", "ahead",
+       "si", "claro", "dale", "hazlo", "confirmo", "adelante", "correlo", "ejecutalo"}
+NO = {"no", "nope", "nah", "cancel", "cancela", "cancelar", "mejor", "don", "t", "dont", "do", "it"}
+
+
+def answer(phrase):
+    """'sí por favor' -> True, 'no cancela' -> False, anything else -> None."""
+    words = core(phrase).split()
+    if words and "no" not in words and all(w in YES for w in words):
+        return True
+    if words and all(w in NO for w in words):
+        return False
+    return None
 
 
 def desktop_ids():
@@ -164,7 +181,7 @@ def openrouter(key_file, models, system, text, max_tokens=400, accept=None):
 
 class VoiceAssistant:
     """States: idle -> listening -> thinking -> (confirm) -> idle. Events from poll():
-    ("status", text[, meta]), ("heard", text), ("run", command, say, meta), ("confirm", command, say),
+    ("status", text[, meta]), ("heard", text), ("run", command, say, meta), ("confirm", command, say, meta),
     ("learned", phrase), ("error", text, meta). meta = {"kind": ..., "app": ...} tells the UI
     which line she should say (open/close/not_open/refused/...)."""
 
@@ -175,7 +192,7 @@ class VoiceAssistant:
         self.log_file = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "shark-viewer-commands.log"
         self.recorder = Recorder()
         self.state = "idle"
-        self.pending = None  # (normalized phrase, command, say) waiting for Run/Cancel
+        self.pending = None  # (normalized phrase, command, say, meta) waiting for Run/Cancel or a spoken yes/no
         self.models = list(FREE_MODELS)
         self.model = None  # faster-whisper, loaded lazily on the worker
         self.jobs = queue.Queue()
@@ -188,8 +205,7 @@ class VoiceAssistant:
     def toggle(self):
         if self.state == "listening":
             self.stop_listening()
-        elif self.state in ("idle", "confirm"):
-            self.pending = None
+        elif self.state in ("idle", "confirm"):  # a pending confirm stays: the answer may be spoken
             self.recorder.start()
             self.state = "listening"
             self.jobs.put(("warm",))  # load the model while she listens
@@ -209,14 +225,16 @@ class VoiceAssistant:
     def confirm(self, approved):
         if not self.pending:
             return
-        phrase, command, say = self.pending
+        phrase, command, say, meta = self.pending
         self.pending, self.state = None, "idle"
         if approved:
             proc = self._run(command)
-            self.events.put(("run", command, say, {"kind": "ai"}))
-            # saved into commands.json only if it really worked
-            self._check(proc, (f"That command failed, so I didn't save it: {command}", {"kind": "ai_failed"}),
-                        (phrase, command, say))
+            self.events.put(("run", command, say, meta))
+            if meta["kind"] == "ai":  # saved into commands.json only if it really worked
+                self._check(proc, (f"That command failed, so I didn't save it: {command}", {"kind": "ai_failed"}),
+                            (phrase, command, say))
+            else:
+                self._check(proc, (f"That didn't work: {command}", {"kind": "failed"}))
         else:
             self.events.put(("status", "Cancelled", {"kind": "cancelled"}))
 
@@ -267,12 +285,25 @@ class VoiceAssistant:
                 Path(path).unlink(missing_ok=True)
         phrase = normalize(text)
         if not phrase:
-            self.state = "idle"
+            self.state = "confirm" if self.pending else "idle"  # still waiting for Run/Cancel
             self.events.put(("error", "I didn't catch that", {"kind": "not_heard"}))
             return
         self.events.put(("heard", text))
 
+        if self.pending:  # she asked "sure?": a spoken yes/no answers it, anything else drops it
+            reply = answer(phrase)
+            if reply is not None:
+                self.confirm(reply)
+                return
+            self.pending = None
+
         hit = self._match(phrase)
+        if hit and hit[3].get("confirm"):  # e.g. turning the PC off: ask first
+            command, say, _, meta = hit
+            self.pending = (phrase, command, say, meta)
+            self.state = "confirm"
+            self.events.put(("confirm", command, say, meta))
+            return
         if hit:
             command, say, failure, meta = hit
             proc = self._run(command)
@@ -291,9 +322,9 @@ class VoiceAssistant:
             self.state = "idle"
             self.events.put(("error", f"Refused (not allowed): {command}", {"kind": "refused"}))
         else:
-            self.pending = (phrase, command, say or "Done")
+            self.pending = (phrase, command, say or "Done", {"kind": "ai"})
             self.state = "confirm"
-            self.events.put(("confirm", command, say or ""))
+            self.events.put(("confirm", command, say or "", {"kind": "ai"}))
 
     # ---- commands ---------------------------------------------------------------
     def _load(self):
@@ -328,7 +359,8 @@ class VoiceAssistant:
             for p in (core(normalize(x)) for x in entry["phrases"]):
                 if p and f" {p} " in padded and (best is None or len(p) > best[0]):
                     best = (len(p), entry["run"], entry.get("say", "Done"),
-                            (f"That didn't work: {entry['run']}", {"kind": "failed"}), {"kind": "phrase"})
+                            (f"That didn't work: {entry['run']}", {"kind": "failed"}),
+                            {"kind": "phrase", "confirm": entry.get("confirm", False), "react": entry.get("react")})
         return best[1:] if best else None
 
     def _learn(self, phrase, command, say):
@@ -368,13 +400,14 @@ class VoiceAssistant:
             self.events.put(("learned", learn[0]))
 
     def _run(self, command):
-        """Start it detached (own session) so it outlives her, output to the commands log."""
+        """Start it detached (own session) so it outlives her, output to the commands log.
+        Runs from the app folder, so commands.json can name scripts like ./poweroff.sh."""
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.log_file, "a") as log:
             log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] $ {command}\n")
             log.flush()
             return subprocess.Popen(command, shell=True, start_new_session=True, stdin=subprocess.DEVNULL,
-                                    stdout=log, stderr=subprocess.STDOUT)
+                                    stdout=log, stderr=subprocess.STDOUT, cwd=self.commands_file.parent)
 
     def _ask_ai(self, text):
         """Ask OpenRouter's free models for one shell command; returns (command|None, say)."""

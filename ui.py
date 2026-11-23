@@ -36,6 +36,7 @@ MUTED = (133, 128, 176)
 TINT = (240, 239, 255)  # hovered rows and buttons
 TRACK = (201, 203, 224)
 ALERT = (226, 76, 76)  # due reminders
+GOOD = (46, 189, 107)  # endpoints that answer
 
 
 def ago(iso):
@@ -275,12 +276,11 @@ class Overlay:
         self.f_day = load_font("sans", round(13 * px))
         self.f_day_bold = load_font("sans:bold", round(13 * px))
         self.f_mono = load_font("monospace", round(12 * px))  # decoded output
-        self.buttons = [("pendings", "Pendings"), ("calendar", "Calendar"), ("talk", "Talk"), ("dance", "Dance"),
-                        ("pose", "Pose"), ("think", "Think")]
+        self.buttons = [("pendings", "Pendings"), ("calendar", "Calendar"), ("observe", "Observability"),
+                        ("think", "Think")]
         self.moves = []  # [{"name": group, "moves": [[expression, label], ...]}, ...]
         # Mini buttons under the big ones: animations, and the tools' cards.
-        self.actions = [("walk", "Walk"), ("greet", "Greet"), ("huh", "Huh?"), ("decode", "Decode"),
-                        ("review", "PR Review"), ("settings", "Settings")]
+        self.actions = [("decode", "Decode"), ("review", "PR Review"), ("settings", "Settings")]
         self.hover = None
         self.show_handles = False
         self.regions = []
@@ -291,6 +291,7 @@ class Overlay:
         self.pr_rows = 0  # rows in the pull-request card, as last drawn
         self.dec_rows = 0  # result rows in the Decode card, as last drawn
         self.pk_rows = 0  # rows in the PR review picker, as last drawn
+        self.obs_rows = 0  # endpoint rows in the Observability card, as last drawn
 
     def resize(self, model_w, model_h, left=None):
         """left: width of the button column (PANEL_W), or 0 on portrait screens where the
@@ -386,7 +387,7 @@ class Overlay:
 
     def render(self, pendings, pendings_open, draft, talk_left=None, active_moves=(), moves_open=True,
                dancing=False, pose_label=None, actions_on=None, cal=None, alerts=(), monitor=None, voice=None,
-               thinking=False, prs=None, gh_badge=None, dec=None, picker=None, settings=None):
+               thinking=False, prs=None, gh_badge=None, dec=None, picker=None, settings=None, observe=None):
         """Return the layer as premultiplied RGBA bytes, rows top to bottom.
 
         talk_left: whole seconds of talking left, or None when she is quiet.
@@ -402,6 +403,8 @@ class Overlay:
         picker: the PR review picker {open, step, path, entries, repo, branches, base, filter,
         selected, skip, status}, or None.
         settings: the Settings card {open, monitors, choice, largest, here, available}, or None.
+        observe: the Observability card {open, endpoints, draft, title, focus ("title"/"url"), status,
+        checked, busy, skip}, or None.
         gh_badge: a function giving (x, y) of the floating GitHub badge (drawn by the effects), to
         make it clickable; called once the cards are laid out, since it moves out of their way.
         """
@@ -420,7 +423,8 @@ class Overlay:
         for name, label in self.buttons:
             rect = (12, y, PANEL_W - 12, y + BUTTON_H)
             active = {"pendings": pendings_open, "calendar": cal["open"], "talk": talk_left is not None,
-                      "dance": dancing, "pose": pose_label is not None, "think": thinking}[name]
+                      "dance": dancing, "pose": pose_label is not None, "think": thinking,
+                      "observe": bool(observe and observe["open"])}[name]
             if name == "talk" and active:
                 label = f"Talking · {talk_left}s"
             elif name == "dance" and active:
@@ -440,8 +444,13 @@ class Overlay:
                    anchor="lm")
             due = cal.get("due_count", 0)
             badge = {"pendings": (pendings.open_count, PINK), "calendar": (due, ALERT)}.get(name)
+            if name == "observe" and observe:  # endpoints registered: green while all answer
+                eps = observe["endpoints"]
+                badge = (len(eps), ALERT if any(e.get("ok") is False for e in eps) else GOOD)
             if badge and badge[0]:  # count of open pendings / reminders waiting to be marked done
                 cx, cy = rect[2] - 16, (rect[1] + rect[3]) / 2
+                if name == "observe":  # its label is long: the badge sits on the corner
+                    cx, cy = rect[2] - 4, rect[1] + 2
                 self._circle(cx, cy, 10, badge[1], edge=1.8)
                 d.text(self.s(cx, cy), str(badge[0]), font=self.f_mini, anchor="mm", fill=(255, 255, 255, 255))
             self.regions.append(("button", name, rect))
@@ -471,6 +480,8 @@ class Overlay:
             self._picker(d, picker)
         elif settings and settings["open"]:
             self._settings(d, settings)
+        elif observe and observe["open"]:
+            self._observe(d, observe)
         if alerts and not cal["open"]:  # the calendar lists them itself
             self._alert(d, alerts)
         if gh_badge:  # over the cards: the badge floats on top of everything
@@ -481,7 +492,8 @@ class Overlay:
         self._footer(d, "Esc  ·  close" + (" the list" if pendings_open else " the calendar" if cal["open"]
                                            else " the comments" if prs_open else " Decode" if dec and dec["open"]
                                            else " PR review" if picker and picker["open"]
-                                           else " Settings" if settings and settings["open"] else ""))
+                                           else " Settings" if settings and settings["open"]
+                                           else " Observability" if observe and observe["open"] else ""))
         return img.convert("RGBa").tobytes()
 
     def _fit(self, text, font, width):
@@ -1045,6 +1057,105 @@ class Overlay:
         d.text(self.s(rect[0] + w / 2, y + 13), "Done", font=self.f_mini, fill=ink, anchor="mm")
         self.regions.append(("set_done", None, rect))
 
+    def _observe(self, d, ob):
+        """Observability: a title and a URL, Enter adds them; every 20 minutes each one gets a
+        GET, a green light when it answers, red when it is not found or off."""
+        ink, muted = (*INK, 255), (*MUTED, 255)
+        pad, x0, x1 = 12, self.left + 16, self.w - 16
+        width = x1 - x0 - 2 * pad
+        eps = ob["endpoints"]
+        title_h, input_h, row_h, buttons_h = 28, 30 * 2, 34, 34
+        fixed = pad + title_h + input_h + 8 + buttons_h + 18 + pad
+        max_h = self.h - TOP_BAR - 50
+        skip = max(0, min(ob.get("skip", 0), len(eps) - 1)) if eps else 0
+        self.obs_rows = len(eps)
+        fit = max(1, int((max_h - fixed - (16 if skip else 0) - 16) // row_h))
+        shown = list(enumerate(eps))[skip:skip + fit]
+        below = len(eps) - skip - len(shown)
+        used = fixed + max(1, len(shown)) * row_h + (16 if skip else 0) + (16 if below else 0)
+        top, bottom, tail = self._bubble_box(used)
+        self._panel((x0, top, x1, bottom), self.left + self.model_w / 2 if tail else None)
+        self.regions.append(("obs_card", None, (x0, top, x1, bottom + (12 if tail else 0))))
+        self.card_top, self.card_bottom = top, bottom
+
+        y = top + pad
+        n = len(eps)
+        d.text(self.s(x0 + pad, y + 10), f"Observability · {n} endpoint{'s' * (n != 1)}", font=self.f_title,
+               fill=(*ACCENT, 255), anchor="lm")
+        note = "checking…" if ob.get("busy") else f"checked {ob['checked']}" if ob.get("checked") else "every 20 min"
+        d.text(self.s(x1 - pad, y + 10), note, font=self.f_hint, fill=muted, anchor="rm")
+        y += title_h
+
+        label_w = 40
+        for key, label, text, hint in (("title", "Title", ob["title"], "A name for it · Tab: next field"),
+                                       ("url", "URL", ob["draft"], "Type or paste a URL · Enter adds")):
+            focused = ob["focus"] == key
+            d.text(self.s(x0 + pad, y + 13), label, font=self.f_day_bold, fill=ink if focused else muted, anchor="lm")
+            field = (x0 + pad + label_w, y, x1 - pad, y + 26)
+            self._box(field, TINT if focused else CARD, radius=8, edge=2.5 if focused else 1.5, shadow=2 if focused else 0)
+            self.regions.append(("obs_title_in" if key == "title" else "obs_input", None, field))
+            tx, cy = field[0] + 10, (field[1] + field[3]) / 2
+            room = field[2] - field[0] - 24
+            if text:
+                shown_text = text
+                while shown_text and self.f_day.getlength(shown_text) > room * self.px:
+                    shown_text = shown_text[1:]  # the end stays in view, where the caret is
+                d.text(self.s(tx, cy), shown_text, font=self.f_day, fill=ink, anchor="lm")
+                caret = tx + self.f_day.getlength(shown_text) / self.px + 1
+            else:
+                d.text(self.s(tx, cy), self._fit(hint, self.f_hint, room), font=self.f_hint, fill=muted, anchor="lm")
+                caret = tx
+            if focused:
+                self.caret = (caret, cy)
+                d.line(self.s(caret, cy - 7, caret, cy + 7), fill=ink, width=max(1, round(2 * self.px)))
+            y += 30
+        y += 4
+
+        if skip:
+            d.text(self.s(x0 + pad, y + 8), f"{skip} more above · scroll up", font=self.f_hint, fill=muted,
+                   anchor="lm")
+            y += 16
+        if not eps:
+            d.text(self.s(x0 + pad, y + row_h / 2), "Nothing watched yet", font=self.f_hint, fill=muted, anchor="lm")
+            y += row_h
+        for i, e in shown:
+            rect = (x0 + 6, y, x1 - 6, y + row_h - 2)
+            if self.hover == ("obs_row", i):
+                self._box(rect, TINT, radius=8, edge=0, shadow=0)
+            light = GOOD if e.get("ok") else ALERT if e.get("ok") is False else TRACK
+            self._circle(x0 + pad + 6, y + row_h / 2 - 1, 6, light, edge=1.5)
+            status = e.get("status") or "waiting"
+            sw = self.f_hint.getlength(status) / self.px
+            d.text(self.s(x1 - pad, y + row_h / 2 - 1), status, font=self.f_hint,
+                   fill=(*(ALERT if e.get("ok") is False else MUTED), 255), anchor="rm")
+            url = e["url"].split("://", 1)[-1]
+            title = e.get("title") or url
+            d.text(self.s(x0 + pad + 18, y + 10), self._fit(title, self.f_day_bold, width - 26 - sw),
+                   font=self.f_day_bold, fill=ink, anchor="lm")
+            d.text(self.s(x0 + pad + 18, y + 24), self._fit(url, self.f_hint, width - 26 - sw),
+                   font=self.f_hint, fill=muted, anchor="lm")
+            self.regions.append(("obs_row", i, rect))
+            y += row_h
+        if below:
+            d.text(self.s(x0 + pad, y + 8), f"{below} more below · scroll down", font=self.f_hint, fill=muted,
+                   anchor="lm")
+            y += 16
+
+        y = bottom - pad - 18 - buttons_h + 6
+        bx = x0 + pad
+        for kind, label, fill in (("obs_add", "Add", PRI), ("obs_paste", "Paste", CARD), ("obs_check", "Check now", CARD),
+                                  ("obs_done", "Done", CARD)):
+            w = self.f_mini.getlength(label) / self.px + 24
+            rect = (bx, y, bx + w, y + 26)
+            hovered = self.hover == (kind, None)
+            self._box(self._pressed(kind, None, rect), TINT if hovered else fill, radius=9, edge=2, shadow=2.5)
+            d.text(self.s(bx + w / 2, y + 13), label, font=self.f_mini, fill=ink, anchor="mm")
+            self.regions.append((kind, None, rect))
+            bx += w + 6
+        note = ob.get("status") or "Click an endpoint to copy its URL · right-click removes it"
+        d.text(self.s(x0 + pad, bottom - pad - 6), self._fit(note, self.f_hint, width), font=self.f_hint,
+               fill=(*(ALERT if "install" in note.lower() else MUTED), 255), anchor="lm")
+
     def _voice(self, d, v):
         """Mic button (top-left) and a banner with what she heard / is doing / Run-Cancel."""
         ink = (*INK, 255)
@@ -1088,7 +1199,8 @@ class Overlay:
             d.text(self.s(rect[0] + w / 2, y + 11), label, font=self.f_mini, fill=ink, anchor="mm")
             self.regions.append((kind, None, rect))
             bx -= w + 6
-        d.text(self.s(x0 + pad, y + 11), "Run once to approve: it is then remembered", font=self.f_hint,
+        note = "Run once (or say yes) to approve: it is then remembered" if v.get("ai") else "Say yes or press Run"
+        d.text(self.s(x0 + pad, y + 11), self._fit(note, self.f_hint, bx - x0 - pad - 6), font=self.f_hint,
                fill=(*MUTED, 255), anchor="lm")
 
     def monitor_rects(self, mon):
