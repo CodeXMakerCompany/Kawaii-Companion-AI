@@ -19,9 +19,9 @@ from pathlib import Path
 
 import cairocffi as cairo
 
-import ui
+from kawaii.render import painter as ui
 
-WORDS_FILE = Path(__file__).with_name("fx_words.json")
+WORDS_FILE = Path(__file__).resolve().parents[2] / "assets" / "fx_words.json"
 TAU = math.pi * 2
 
 

@@ -20,8 +20,8 @@ from pywayland.protocol.ext_foreign_toplevel_list_v1 import ExtForeignToplevelLi
 from pywayland.protocol.ext_workspace_v1 import ExtWorkspaceManagerV1
 from pywayland.protocol.wayland import WlOutput
 
-from protocols.cosmic_toplevel_info_unstable_v1 import ZcosmicToplevelInfoV1
-from protocols.cosmic_toplevel_management_unstable_v1 import ZcosmicToplevelManagerV1
+from kawaii.wayland.protocols.cosmic_toplevel_info_unstable_v1 import ZcosmicToplevelInfoV1
+from kawaii.wayland.protocols.cosmic_toplevel_management_unstable_v1 import ZcosmicToplevelManagerV1
 
 ACTIVE = 1  # ext_workspace_handle_v1 state bit
 

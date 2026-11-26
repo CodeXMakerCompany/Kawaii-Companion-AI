@@ -5,7 +5,7 @@
   normally wires up itself: idle motion, expressions, eye blink and lip sync.
 - Never touches the source folder.
 
-Usage: python -I build_model.py <source_model_dir> [--out model] [--tex 2048]
+Usage: python -I tools/build_model.py <source_model_dir> [--out model] [--tex 2048]
 """
 
 import argparse
@@ -23,7 +23,7 @@ def load_json(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("source", type=Path)
-    ap.add_argument("--out", type=Path, default=Path(__file__).parent / "model")
+    ap.add_argument("--out", type=Path, default=Path(__file__).resolve().parent.parent / "model")
     ap.add_argument("--tex", type=int, default=2048, help="max texture edge in px")
     args = ap.parse_args()
 

@@ -22,9 +22,9 @@ from pywayland.protocol.cursor_shape_v1 import WpCursorShapeDeviceV1, WpCursorSh
 from pywayland.protocol.wayland import WlCompositor, WlOutput, WlSeat
 from pywayland.protocol.xdg_output_unstable_v1 import ZxdgOutputManagerV1
 
-from protocols.wlr_layer_shell_unstable_v1 import ZwlrLayerShellV1, ZwlrLayerSurfaceV1
+from kawaii.wayland.protocols.wlr_layer_shell_unstable_v1 import ZwlrLayerShellV1, ZwlrLayerSurfaceV1
 
-BTN_LEFT, BTN_RIGHT = 0x110, 0x111
+from kawaii.input.keys import BTN_LEFT, BTN_RIGHT  # noqa: F401  re-exported for the window's users
 
 _wl_egl = ctypes.CDLL("libwayland-egl.so.1")
 _wl_egl.wl_egl_window_create.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
