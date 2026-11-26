@@ -76,6 +76,7 @@ from fx import Effects, Press
 from agents import WAITING, WATCHERS, WORKING
 from prwatch import PRWatcher
 from observe import Pinger
+from rules import Rulebook
 import decode
 import prreview
 from winmove import WindowMover
@@ -102,7 +103,8 @@ CLICKABLE = ("button", "item", "move", "moves_toggle", "action", "cal_prev", "ca
              "cal_new", "cal_delete", "cal_event", "cal_done", "cal_yearly", "alert_action", "monitor_toggle",
              "mic", "voice_run", "voice_cancel", "gh_badge", "dec_paste", "dec_run", "dec_clear", "dec_copy",
              "dec_explain", "pk_row", "pk_back", "pk_open", "pk_cancel", "set_mon", "set_done",
-             "obs_add", "obs_paste", "obs_check", "obs_done", "obs_row", "obs_input", "obs_title_in")
+             "obs_add", "obs_paste", "obs_check", "obs_done", "obs_row", "obs_input", "obs_title_in",
+             "rules_add", "rules_paste", "rules_copy", "rules_back", "rules_done", "rules_row")
 
 MIN_MODEL, MAX_MODEL = (300, 360), (1600, 2200)  # her area, in px
 SILHOUETTE_BAND = 24  # px; input-region rows follow her outline in bands this tall
@@ -850,6 +852,7 @@ def main():
     badges = {}  # app name -> its floating icon, while the app is open
     prs = PRWatcher(CONFIG_DIR / "prwatch.json")
     pinger = Pinger(CONFIG_DIR / "observe.json")  # the Observability endpoints
+    rulebook = Rulebook(CONFIG_DIR / "rules.json")  # Business Rules, per company
     gh_icon = CONFIG_DIR / "github.png"  # optional: your own GitHub icon; a pull-request symbol otherwise
     reviewer = prreview.Reviewer()
     mover = WindowMover()  # puts the windows of apps she opens on the monitor you chose
@@ -941,6 +944,11 @@ def main():
         "obs_focus": "title",  # which field typing goes to: title or url
         "obs_status": "",  # a short note: Copied!, why paste failed
         "obs_skip": 0,  # endpoint rows scrolled past
+        "rules_open": False,  # the Business Rules card
+        "rules_company": None,  # index of the company opened, None: the list of companies
+        "rules_draft": "",  # the company name or rule being typed
+        "rules_status": "",  # a short note: Copied!, why paste failed
+        "rules_skip": 0,  # rows scrolled past
         "gh_hop_until": 0.0,  # the GitHub badge hops until then (new comments just came in)
         "walk_x": 0.0,
         "banner_shown": False,
@@ -1017,6 +1025,7 @@ def main():
         if on:
             pendings.roll_day()
             view["cal_open"] = view["dec_open"] = view["pk_open"] = view["set_open"] = view["obs_open"] = False  # one card at a time
+            view["rules_open"] = False
             set_prs(False)
         view["open"] = on
         view["dirty"] = True
@@ -1026,7 +1035,7 @@ def main():
         if on:
             set_open(False)
             set_prs(False)
-            view["dec_open"] = view["pk_open"] = view["set_open"] = view["obs_open"] = False
+            view["dec_open"] = view["pk_open"] = view["set_open"] = view["obs_open"] = view["rules_open"] = False
             today = datetime.date.today()
             if not view["cal_editing"]:
                 view["cal_month"], view["cal_selected"] = (today.year, today.month), today.isoformat()
@@ -1038,7 +1047,7 @@ def main():
         """The pull-request comments card; closing it marks them read (and the badge goes)."""
         if on:
             view["open"] = view["cal_open"] = view["dec_open"] = view["pk_open"] = view["set_open"] = False
-            view["obs_open"] = False
+            view["obs_open"] = view["rules_open"] = False
         elif view["pr_open"]:
             prs.mark_read()
         view.update(pr_open=on, pr_skip=0, dirty=True)
@@ -1046,18 +1055,21 @@ def main():
     def set_decoder(on):
         if on:
             view["open"] = view["cal_open"] = view["pk_open"] = view["set_open"] = view["obs_open"] = False  # one card at a time
+            view["rules_open"] = False
             set_prs(False)
         view.update(dec_open=on, dirty=True)
 
     def set_settings(on):
         if on:
             view["open"] = view["cal_open"] = view["dec_open"] = view["pk_open"] = view["obs_open"] = False  # one card at a time
+            view["rules_open"] = False
             set_prs(False)
         view.update(set_open=on, dirty=True)
 
     def set_observe(on):
         if on:
             view["open"] = view["cal_open"] = view["dec_open"] = view["pk_open"] = view["set_open"] = False  # one card at a time
+            view["rules_open"] = False
             set_prs(False)
         view.update(obs_open=on, obs_skip=0, obs_focus="title", obs_status="", dirty=True)
 
@@ -1096,6 +1108,55 @@ def main():
         view.update(obs_status="Copied!" if ok else "Could not copy", dirty=True)
         return ok
 
+    def set_rules(on):
+        if on:
+            view["open"] = view["cal_open"] = view["dec_open"] = view["pk_open"] = view["set_open"] = False  # one card at a time
+            view["obs_open"] = False
+            set_prs(False)
+        view.update(rules_open=on, rules_company=None, rules_draft="", rules_skip=0, rules_status="", dirty=True)
+
+    def open_company(index):
+        view.update(rules_company=index, rules_draft="", rules_skip=0, rules_status="", dirty=True)
+
+    def add_rule(rect=None):
+        """In the list: opens the company typed (adding it if new); inside one: adds the rule."""
+        text = view["rules_draft"]
+        if view["rules_company"] is None:
+            index = rulebook.add_company(text)
+            if index is None:
+                view.update(rules_status="Type a company name first", dirty=True)
+                return
+            open_company(index)
+        elif rulebook.add_rule(view["rules_company"], text):
+            view.update(rules_draft="", rules_status="", rules_skip=None)  # None: scrolled to the new one
+        else:
+            view["rules_status"] = "Write the rule first"
+        if rect:
+            effects.done(rect)
+        view["dirty"] = True
+
+    def paste_rule():
+        if not decode.has_clipboard():
+            view.update(rules_status="Install wl-clipboard to copy and paste", dirty=True)
+            return
+        text = (decode.clipboard_get() or "").strip()
+        if not text:
+            view.update(rules_status="The clipboard has no text", dirty=True)
+            return
+        view["rules_draft"] += " ".join(text.split())
+        view.update(rules_status="", dirty=True)
+
+    def copy_rules(index=None):
+        """One rule, or (index None) the whole numbered list, ready to paste into a prompt."""
+        if not decode.has_clipboard():
+            view.update(rules_status="Install wl-clipboard to copy and paste", dirty=True)
+            return False
+        ci = view["rules_company"]
+        text = rulebook.as_text(ci) if index is None else rulebook.companies[ci]["rules"][index]["text"]
+        ok = decode.clipboard_set(text)
+        view.update(rules_status="Copied!" if ok else "Could not copy", dirty=True)
+        return ok
+
     def announce_down(went_down):
         """She says which endpoint stopped answering, and the Observability button gets a nudge."""
         e = went_down[0]
@@ -1118,6 +1179,7 @@ def main():
         """The PR review picker, opening on ~/Projects."""
         if on:
             view["open"] = view["cal_open"] = view["dec_open"] = view["set_open"] = False  # one card at a time
+            view["obs_open"] = view["rules_open"] = False
             set_prs(False)
             start = prreview.START if prreview.START.is_dir() else Path.home()
             view.update(pk_step="folder", pk_path=start, pk_entries=prreview.folders(start), pk_skip=0, pk_status="",
@@ -1591,6 +1653,40 @@ def main():
                 effects.pick(rect)
         elif hit and hit[0] in ("obs_title_in", "obs_input") and button == BTN_LEFT:
             view.update(obs_focus="title" if hit[0] == "obs_title_in" else "url", dirty=True)
+        elif hit == ("button", "rules") and button == BTN_LEFT:
+            set_rules(not view["rules_open"])
+            if view["rules_open"]:
+                effects.pop(rect)
+            else:
+                effects.poof(rect[2] - 16, (rect[1] + rect[3]) / 2)
+        elif hit and hit[0] in ("rules_add", "rules_paste", "rules_copy", "rules_back", "rules_done") \
+                and button == BTN_LEFT:
+            presses[hit] = Press()
+            if hit[0] == "rules_add":
+                add_rule(rect)
+            elif hit[0] == "rules_paste":
+                paste_rule()
+            elif hit[0] == "rules_copy":
+                if copy_rules():
+                    effects.pick(rect)
+            elif hit[0] == "rules_back":
+                open_company(None)
+            else:
+                set_rules(False)
+        elif hit and hit[0] == "rules_row" and button == BTN_RIGHT:
+            effects.scrap(rect)
+            if view["rules_company"] is None:
+                rulebook.remove_company(hit[1])
+            else:
+                rulebook.remove_rule(view["rules_company"], hit[1])
+            overlay.hover = None
+            view["dirty"] = True
+        elif hit and hit[0] == "rules_row" and button == BTN_LEFT:
+            if view["rules_company"] is None:
+                open_company(hit[1])
+                effects.pop(rect)
+            elif copy_rules(hit[1]):
+                effects.pick(rect)
         elif hit == ("action", "review") and button == BTN_LEFT:
             set_picker(not view["pk_open"])
             if view["pk_open"]:
@@ -1611,7 +1707,8 @@ def main():
             if view["pr_open"]:
                 effects.pick(rect)
         elif hit and hit[0] in ("card", "cal_card", "cal_input", "alert", "monitor_panel", "voice_banner", "pr_card",
-                                "dec_card", "dec_input", "pk_card", "pk_filter", "set_card", "obs_card"):
+                                "dec_card", "dec_input", "pk_card", "pk_filter", "set_card", "obs_card",
+                                "rules_card", "rules_input"):
             pass  # clicking a card just keeps keyboard focus here (no drag)
         elif button == BTN_LEFT:
             kind = hit[1] if hit and hit[0] == "handle" else "move"
@@ -1628,6 +1725,10 @@ def main():
             return
         if view["obs_open"] and (overlay.hit(*view["mouse"]) or ("",))[0] in ("obs_card", "obs_row", "obs_input"):
             view.update(obs_skip=max(0, min(view["obs_skip"] - steps, overlay.obs_rows - 1)), dirty=True)
+            return
+        if view["rules_open"] and (overlay.hit(*view["mouse"]) or ("",))[0] in ("rules_card", "rules_row",
+                                                                                 "rules_input"):
+            view.update(rules_skip=max(0, min(overlay.rules_skip - steps, overlay.rules_rows - 1)), dirty=True)
             return
         if view["pr_open"] and overlay.hit(*view["mouse"]) in (("pr_card", None), ("gh_badge", None)):
             skip = max(0, min(view["pr_skip"] - steps, overlay.pr_rows - 1))  # wheel down: further down the list
@@ -1655,6 +1756,13 @@ def main():
                 key = "obs_draft" if view["obs_focus"] == "url" else "obs_title"
                 view[key] += typed
                 view["dirty"] = True
+            return
+        if view["rules_open"]:
+            typed = "".join(c for c in text if c.isprintable())  # Ctrl+letters arrive as control characters
+            if typed:
+                view["rules_draft"] += typed
+                view["dirty"] = True
+                after_paint.append(lambda: overlay.caret and effects.dust(*overlay.caret))
             return
         if view["dec_open"]:
             typed = "".join(c for c in text if c.isprintable())  # Ctrl+letters arrive as control characters
@@ -1710,6 +1818,24 @@ def main():
                     copy_endpoint(hit[1])
             elif key == KEY_BACKSPACE and view[field]:
                 view[field] = view[field].rstrip().rpartition(" ")[0] if win.xkb.ctrl() else view[field][:-1]
+                view["dirty"] = True
+            return
+        if view["rules_open"]:  # Enter opens the company / adds the rule, Esc goes back (then closes), Ctrl+V pastes
+            if key == KEY_ESC:
+                if view["rules_company"] is not None:
+                    open_company(None)
+                else:
+                    set_rules(False)
+            elif key in (KEY_ENTER, KEY_KPENTER):
+                add_rule(overlay.rect_of("rules_add"))
+            elif key == KEY_V and win.xkb.ctrl():
+                paste_rule()
+            elif key == KEY_C and win.xkb.ctrl() and view["rules_company"] is not None:
+                hit = overlay.hit(*view["mouse"])
+                copy_rules(hit[1] if hit and hit[0] == "rules_row" else None)
+            elif key == KEY_BACKSPACE and view["rules_draft"]:
+                draft = view["rules_draft"]
+                view["rules_draft"] = draft.rstrip().rpartition(" ")[0] if win.xkb.ctrl() else draft[:-1]
                 view["dirty"] = True
             return
         if view["dec_open"]:  # Enter decodes, Ctrl+V pastes, Ctrl+C copies, Esc closes
@@ -2184,6 +2310,9 @@ def main():
                                                        "skip": view["obs_skip"],
                                                        "checked": time.strftime("%H:%M", time.localtime(pinger.checked_at))
                                                        if pinger.checked_at else None},
+                                              rules={"open": view["rules_open"], "companies": rulebook.companies,
+                                                     "company": view["rules_company"], "draft": view["rules_draft"],
+                                                     "status": view["rules_status"], "skip": view["rules_skip"]},
                                               cal=cal, alerts=alerts(), monitor=monitor.view(view["mon_open"]),
                                               voice={"state": assistant.state, "text": view["voice_text"],
                                                      "error": view["voice_error"], "command": view["voice_command"],

@@ -277,7 +277,7 @@ class Overlay:
         self.f_day_bold = load_font("sans:bold", round(13 * px))
         self.f_mono = load_font("monospace", round(12 * px))  # decoded output
         self.buttons = [("pendings", "Pendings"), ("calendar", "Calendar"), ("observe", "Observability"),
-                        ("think", "Think")]
+                        ("rules", "Business Rules")]  # Think is hidden for now; its handler stays
         self.moves = []  # [{"name": group, "moves": [[expression, label], ...]}, ...]
         # Mini buttons under the big ones: animations, and the tools' cards.
         self.actions = [("decode", "Decode"), ("review", "PR Review"), ("settings", "Settings")]
@@ -292,6 +292,7 @@ class Overlay:
         self.dec_rows = 0  # result rows in the Decode card, as last drawn
         self.pk_rows = 0  # rows in the PR review picker, as last drawn
         self.obs_rows = 0  # endpoint rows in the Observability card, as last drawn
+        self.rules_rows = self.rules_skip = 0  # company or rule rows in the Business Rules card, and scrolled past
 
     def resize(self, model_w, model_h, left=None):
         """left: width of the button column (PANEL_W), or 0 on portrait screens where the
@@ -387,7 +388,8 @@ class Overlay:
 
     def render(self, pendings, pendings_open, draft, talk_left=None, active_moves=(), moves_open=True,
                dancing=False, pose_label=None, actions_on=None, cal=None, alerts=(), monitor=None, voice=None,
-               thinking=False, prs=None, gh_badge=None, dec=None, picker=None, settings=None, observe=None):
+               thinking=False, prs=None, gh_badge=None, dec=None, picker=None, settings=None, observe=None,
+               rules=None):
         """Return the layer as premultiplied RGBA bytes, rows top to bottom.
 
         talk_left: whole seconds of talking left, or None when she is quiet.
@@ -405,6 +407,8 @@ class Overlay:
         settings: the Settings card {open, monitors, choice, largest, here, available}, or None.
         observe: the Observability card {open, endpoints, draft, title, focus ("title"/"url"), status,
         checked, busy, skip}, or None.
+        rules: the Business Rules card {open, companies, company (index of the one opened, or None
+        for the list of companies), draft, status, skip}, or None.
         gh_badge: a function giving (x, y) of the floating GitHub badge (drawn by the effects), to
         make it clickable; called once the cards are laid out, since it moves out of their way.
         """
@@ -424,7 +428,7 @@ class Overlay:
             rect = (12, y, PANEL_W - 12, y + BUTTON_H)
             active = {"pendings": pendings_open, "calendar": cal["open"], "talk": talk_left is not None,
                       "dance": dancing, "pose": pose_label is not None, "think": thinking,
-                      "observe": bool(observe and observe["open"])}[name]
+                      "observe": bool(observe and observe["open"]), "rules": bool(rules and rules["open"])}[name]
             if name == "talk" and active:
                 label = f"Talking · {talk_left}s"
             elif name == "dance" and active:
@@ -447,9 +451,11 @@ class Overlay:
             if name == "observe" and observe:  # endpoints registered: green while all answer
                 eps = observe["endpoints"]
                 badge = (len(eps), ALERT if any(e.get("ok") is False for e in eps) else GOOD)
+            if name == "rules" and rules:  # companies with rules written down
+                badge = (len(rules["companies"]), ACCENT)
             if badge and badge[0]:  # count of open pendings / reminders waiting to be marked done
                 cx, cy = rect[2] - 16, (rect[1] + rect[3]) / 2
-                if name == "observe":  # its label is long: the badge sits on the corner
+                if name in ("observe", "rules"):  # their labels are long: the badge sits on the corner
                     cx, cy = rect[2] - 4, rect[1] + 2
                 self._circle(cx, cy, 10, badge[1], edge=1.8)
                 d.text(self.s(cx, cy), str(badge[0]), font=self.f_mini, anchor="mm", fill=(255, 255, 255, 255))
@@ -482,6 +488,8 @@ class Overlay:
             self._settings(d, settings)
         elif observe and observe["open"]:
             self._observe(d, observe)
+        elif rules and rules["open"]:
+            self._rules(d, rules)
         if alerts and not cal["open"]:  # the calendar lists them itself
             self._alert(d, alerts)
         if gh_badge:  # over the cards: the badge floats on top of everything
@@ -493,7 +501,8 @@ class Overlay:
                                            else " the comments" if prs_open else " Decode" if dec and dec["open"]
                                            else " PR review" if picker and picker["open"]
                                            else " Settings" if settings and settings["open"]
-                                           else " Observability" if observe and observe["open"] else ""))
+                                           else " Observability" if observe and observe["open"]
+                                           else " Business Rules" if rules and rules["open"] else ""))
         return img.convert("RGBa").tobytes()
 
     def _fit(self, text, font, width):
@@ -1153,6 +1162,131 @@ class Overlay:
             self.regions.append((kind, None, rect))
             bx += w + 6
         note = ob.get("status") or "Click an endpoint to copy its URL · right-click removes it"
+        d.text(self.s(x0 + pad, bottom - pad - 6), self._fit(note, self.f_hint, width), font=self.f_hint,
+               fill=(*(ALERT if "install" in note.lower() else MUTED), 255), anchor="lm")
+
+    def _rules(self, d, rb):
+        """Business Rules: the list of companies (type a name, Enter opens it, new or not), and
+        inside one, its rules as a numbered list (type a rule, Enter adds it)."""
+        ink, muted = (*INK, 255), (*MUTED, 255)
+        pad, x0, x1 = 12, self.left + 16, self.w - 16
+        width = x1 - x0 - 2 * pad
+        companies, ci = rb["companies"], rb["company"]
+        company = companies[ci] if ci is not None else None
+        line_h, title_h, input_h, buttons_h = 17, 28, 30, 34
+        fixed = pad + title_h + input_h + 8 + buttons_h + 18 + pad
+        max_h = self.h - TOP_BAR - 50
+        num_w = 26  # room for "12." before each rule
+        if company:  # rules wrap: every row is as tall as its lines
+            items = [(i, self._wrap(r["text"], self.f_day, width - num_w - 8)[:4])
+                     for i, r in enumerate(company["rules"])]
+        else:
+            items = [(i, None) for i in range(len(companies))]
+        row_h = (lambda lines: len(lines) * line_h + 10) if company else (lambda lines: 34)
+        room = max_h - fixed - 32
+        skip = rb.get("skip", 0)
+        if skip is None:  # scrolled to the end: as many of the last rows as fit
+            skip, h = len(items), 0
+            while skip and h + row_h(items[skip - 1][1]) <= room:
+                skip -= 1
+                h += row_h(items[skip][1])
+        skip = max(0, min(skip, len(items) - 1)) if items else 0
+        self.rules_rows, self.rules_skip = len(items), skip
+        room = max_h - fixed - (16 if skip else 0) - 16
+        shown, used_rows = [], 0
+        for i, lines in items[skip:]:
+            h = row_h(lines)
+            if shown and used_rows + h > room:
+                break
+            shown.append((i, lines, h))
+            used_rows += h
+        below = len(items) - skip - len(shown)
+        used = fixed + max(34, used_rows) + (16 if skip else 0) + (16 if below else 0)
+        top, bottom, tail = self._bubble_box(used)
+        self._panel((x0, top, x1, bottom), self.left + self.model_w / 2 if tail else None)
+        self.regions.append(("rules_card", None, (x0, top, x1, bottom + (12 if tail else 0))))
+        self.card_top, self.card_bottom = top, bottom
+
+        y = top + pad
+        if company:
+            n = len(company["rules"])
+            title, note = company["name"], f"{n} rule{'s' * (n != 1)}"
+        else:
+            n = len(companies)
+            title, note = "Business Rules", f"{n} compan{'ies' if n != 1 else 'y'}"
+        nw = self.f_hint.getlength(note) / self.px
+        d.text(self.s(x0 + pad, y + 10), self._fit(title, self.f_title, width - nw - 10), font=self.f_title,
+               fill=(*ACCENT, 255), anchor="lm")
+        d.text(self.s(x1 - pad, y + 10), note, font=self.f_hint, fill=muted, anchor="rm")
+        y += title_h
+
+        label, hint = ("Rule", "Write a rule · Enter adds it") if company else \
+            ("Company", "A company name · Enter opens it")
+        label_w = self.f_day_bold.getlength("Company") / self.px + 8
+        d.text(self.s(x0 + pad, y + 13), label, font=self.f_day_bold, fill=ink, anchor="lm")
+        field = (x0 + pad + label_w, y, x1 - pad, y + 26)
+        self._box(field, TINT, radius=8, edge=2.5, shadow=2)
+        self.regions.append(("rules_input", None, field))
+        tx, cy = field[0] + 10, (field[1] + field[3]) / 2
+        space = field[2] - field[0] - 24
+        text = rb["draft"]
+        if text:
+            shown_text = text
+            while shown_text and self.f_day.getlength(shown_text) > space * self.px:
+                shown_text = shown_text[1:]  # the end stays in view, where the caret is
+            d.text(self.s(tx, cy), shown_text, font=self.f_day, fill=ink, anchor="lm")
+            caret = tx + self.f_day.getlength(shown_text) / self.px + 1
+        else:
+            d.text(self.s(tx, cy), self._fit(hint, self.f_hint, space), font=self.f_hint, fill=muted, anchor="lm")
+            caret = tx
+        self.caret = (caret, cy)
+        d.line(self.s(caret, cy - 7, caret, cy + 7), fill=ink, width=max(1, round(2 * self.px)))
+        y += input_h + 8
+
+        if skip:
+            d.text(self.s(x0 + pad, y + 8), f"{skip} more above · scroll up", font=self.f_hint, fill=muted,
+                   anchor="lm")
+            y += 16
+        if not items:
+            empty = "No rules yet · start writing" if company else "No companies yet · type a name"
+            d.text(self.s(x0 + pad, y + 17), empty, font=self.f_hint, fill=muted, anchor="lm")
+            y += 34
+        for i, lines, h in shown:
+            rect = (x0 + 6, y, x1 - 6, y + h - 2)
+            if self.hover == ("rules_row", i):
+                self._box(rect, TINT, radius=8, edge=0, shadow=0)
+            if company:
+                d.text(self.s(x0 + pad, y + 5), f"{i + 1}.", font=self.f_day_bold, fill=(*ACCENT, 255))
+                for k, ln in enumerate(lines):
+                    d.text(self.s(x0 + pad + num_w, y + 5 + k * line_h), ln, font=self.f_day, fill=ink)
+            else:
+                c = companies[i]
+                count = f"{len(c['rules'])} rule{'s' * (len(c['rules']) != 1)}  ›"
+                cw = self.f_hint.getlength(count) / self.px
+                d.text(self.s(x0 + pad, y + h / 2 - 1), self._fit(c["name"], self.f_day_bold, width - cw - 10),
+                       font=self.f_day_bold, fill=ink, anchor="lm")
+                d.text(self.s(x1 - pad, y + h / 2 - 1), count, font=self.f_hint, fill=muted, anchor="rm")
+            self.regions.append(("rules_row", i, rect))
+            y += h
+        if below:
+            d.text(self.s(x0 + pad, y + 8), f"{below} more below · scroll down", font=self.f_hint, fill=muted,
+                   anchor="lm")
+
+        y = bottom - pad - 18 - buttons_h + 6
+        bx = x0 + pad
+        buttons = [("rules_back", "‹ Back", CARD), ("rules_add", "Add", PRI), ("rules_paste", "Paste", CARD),
+                   ("rules_copy", "Copy all", CARD)] if company else \
+            [("rules_add", "Open", PRI), ("rules_paste", "Paste", CARD)]
+        for kind, label, fill in buttons + [("rules_done", "Done", CARD)]:
+            w = self.f_mini.getlength(label) / self.px + 24
+            rect = (bx, y, bx + w, y + 26)
+            hovered = self.hover == (kind, None)
+            self._box(self._pressed(kind, None, rect), TINT if hovered else fill, radius=9, edge=2, shadow=2.5)
+            d.text(self.s(bx + w / 2, y + 13), label, font=self.f_mini, fill=ink, anchor="mm")
+            self.regions.append((kind, None, rect))
+            bx += w + 6
+        note = rb.get("status") or ("Click a rule to copy it · right-click removes it" if company
+                                    else "Click a company to open it · right-click removes it")
         d.text(self.s(x0 + pad, bottom - pad - 6), self._fit(note, self.f_hint, width), font=self.f_hint,
                fill=(*(ALERT if "install" in note.lower() else MUTED), 255), anchor="lm")
 
