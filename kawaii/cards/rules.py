@@ -15,6 +15,7 @@ class RulesCard(Card):
     open_fx = "pop"
     hits = ("rules_add", "rules_paste", "rules_copy", "rules_back", "rules_done", "rules_row")
     scroll_hits = ("rules_card", "rules_row", "rules_input")
+    needs_client = True
 
     def __init__(self, screen, rulebook, clipboard):
         super().__init__(screen)
@@ -23,11 +24,16 @@ class RulesCard(Card):
         self.draft = ""  # the company name or rule being typed
         self.status = ""  # a short note: Copied!, why paste failed
         self.skip = 0  # rows scrolled past (None: down to the newest rule)
+        self.client = None  # the client picked: its rules are the only ones shown (no list of companies)
 
     def _reset(self):
-        self.open_company(None)
+        self.open_company(self.rulebook.add_company(self.client) if self.client else None)
 
     opened = closed = _reset
+
+    def client_changed(self, space):
+        self.client = space.name
+        self._reset()
 
     def open_company(self, index):
         self.company, self.draft, self.skip, self.status = index, "", 0, ""
@@ -102,13 +108,14 @@ class RulesCard(Card):
             if self.copy():
                 self.fx.pick(rect)
         elif kind == "rules_back":
-            self.open_company(None)
+            if not self.client:
+                self.open_company(None)
         else:
             self.close()
 
     def key(self, key, ctrl):
         if key == KEY_ESC:
-            self.open_company(None) if self.company is not None else self.close()
+            self.open_company(None) if self.company is not None and not self.client else self.close()
         elif key in ENTER:
             self.add(self.screen.rect("rules_add"))
         elif key == KEY_V and ctrl:
@@ -135,4 +142,4 @@ class RulesCard(Card):
 
     def payload(self):
         return {"open": self.is_open, "companies": self.rulebook.companies, "company": self.company,
-                "draft": self.draft, "status": self.status, "skip": self.skip}
+                "draft": self.draft, "status": self.status, "skip": self.skip, "locked": bool(self.client)}

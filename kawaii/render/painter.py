@@ -115,7 +115,7 @@ class Painter:
         self.image = None  # the image being painted
         # Rows as last drawn by the scrolling cards (their cards clamp the wheel with these).
         self.pr_rows = self.dec_rows = self.pk_rows = self.obs_rows = 0
-        self.rules_rows = self.rules_skip = 0
+        self.rules_rows = self.rules_skip = self.vault_rows = self.client_rows = 0
 
     def begin_frame(self, image):
         """Start painting a fresh layer: nothing drawn, nothing clickable yet."""

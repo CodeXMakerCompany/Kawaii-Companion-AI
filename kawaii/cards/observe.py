@@ -3,6 +3,7 @@ answering). Tab switches field, Enter adds (from Title: goes to URL), click copi
 right-click removes it, Ctrl+V pastes, Esc closes."""
 
 from kawaii.cards.base import Card, clamp_skip, clock
+from kawaii.features.observe import Pinger
 from kawaii.input.keys import BTN_LEFT, BTN_RIGHT, ENTER, KEY_BACKSPACE, KEY_C, KEY_ESC, KEY_TAB, KEY_V
 from kawaii.input.textfield import erase, printable
 
@@ -15,6 +16,7 @@ class ObserveCard(Card):
     open_fx = "pop"
     hits = ("obs_add", "obs_paste", "obs_check", "obs_done", "obs_row", "obs_title_in", "obs_input")
     scroll_hits = ("obs_card", "obs_row", "obs_input")
+    needs_client = True
 
     def __init__(self, screen, pinger, clipboard):
         super().__init__(screen)
@@ -29,6 +31,10 @@ class ObserveCard(Card):
         self.skip, self.focus, self.status = 0, "title", ""
 
     opened = closed = _reset
+
+    def client_changed(self, space):
+        self.pinger, self.draft, self.title = Pinger(space.observe), "", ""
+        self._reset()
 
     def _field(self):
         return "draft" if self.focus == "url" else "title"

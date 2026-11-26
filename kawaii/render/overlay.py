@@ -14,7 +14,7 @@ from kawaii.render import bubbles, monitor_view
 from kawaii.render.painter import (ACCENT, ALERT, BUTTON_H, BUTTON_STEP, CARD, GOOD, HANDLE_R, INK, NOTES_H,
                                    PANEL_W, PINK, PRI, SOFT, TINT, TOP_BAR, Painter)
 
-ORDER = ("pendings", "calendar", "prs", "decoder", "picker", "settings", "observe", "rules")  # one is open at a time
+ORDER = ("clients", "pendings", "calendar", "prs", "decoder", "picker", "settings", "observe", "rules", "vault")  # one is open at a time
 
 
 class Overlay(Painter):
@@ -23,8 +23,8 @@ class Overlay(Painter):
     def __init__(self, model_w, model_h, px, left=PANEL_W):
         super().__init__(px)
         self.resize(model_w, model_h, left)
-        self.buttons = [("pendings", "Pendings"), ("calendar", "Calendar"), ("observe", "Observability"),
-                        ("rules", "Business Rules")]  # Think is hidden for now; its handler stays
+        self.buttons = [("client", "Choose client"), ("pendings", "Pendings"), ("calendar", "Calendar"), ("observe", "Observability"),
+                        ("rules", "Business Rules"), ("vault", "Vault")]  # Think is hidden for now; its handler stays
         self.moves = []  # [{"name": group, "moves": [[expression, label], ...]}, ...]
         # Mini buttons under the big ones: animations, and the tools' cards.
         self.actions = [("decode", "Decode"), ("review", "PR Review"), ("settings", "Settings")]
@@ -44,16 +44,20 @@ class Overlay(Painter):
         r = HANDLE_R
         mid_x = self.left + self.model_w / 2
         mid_y = NOTES_H + (self.h - NOTES_H) / 2
+        stack_x = monitor_view.rects(self, {"open": False})[0][0]  # the top-right stack: pill, Focus, clocks
+        top_x = max(self.left + 3 * r, min(mid_x, stack_x - r - 8))  # beside it, never under it
         centers = {"left": (self.left + r + 2, mid_y), "right": (self.w - r - 2, mid_y),
-                   "top": (mid_x, TOP_BAR + r + 2), "bottom": (mid_x, self.h - r - 2)}  # top: under the monitor pill
+                   "top": (top_x, TOP_BAR + r + 2), "bottom": (mid_x, self.h - r - 2)}
         return {name: (cx - r, cy - r, cx + r, cy + r) for name, (cx, cy) in centers.items()}
 
-    def render_monitor(self, mon):
-        """The system monitor's own layer: (premultiplied bytes, (x, y, w, h))."""
-        return monitor_view.render(self, mon)
+    def render_monitor(self, mon, focus=None, clocks=None):
+        """The top-right stack's own layer (system monitor, Focus switch, customer clocks):
+        (premultiplied bytes, (x, y, w, h))."""
+        return monitor_view.render(self, mon, focus, clocks)
 
     def render(self, cards, talk_left=None, active_moves=(), moves_open=True, dancing=False, pose_label=None,
-               actions_on=None, alerts=(), monitor=None, voice=None, thinking=False, gh_badge=None):
+               actions_on=None, alerts=(), monitor=None, voice=None, thinking=False, gh_badge=None,
+               badges=None, focus=None, clocks=None):
         """Return the layer as premultiplied RGBA bytes, rows top to bottom.
 
         cards: each card's payload by name (see ORDER); the open one is drawn by its view,
@@ -66,6 +70,9 @@ class Overlay(Painter):
         thinking: the Think pose is on.
         gh_badge: a function giving (x, y) of the floating GitHub badge (drawn by the effects), to
         make it clickable; called once the cards are laid out, since it moves out of their way.
+        badges: {app name: function giving (x, y)} of the floating app icons, clickable the same way.
+        focus: the Focus switch and its dropdown {on, label, open, rows, total}, or None.
+        clocks: the customer clocks [{name, time, diff, day, working}], or None.
         """
         is_open = {name: bool(cards.get(name, {}).get("open")) for name in ORDER}
         img = Image.new("RGBA", (round(self.w * self.px), round(self.h * self.px)), (0, 0, 0, 0))
@@ -79,17 +86,17 @@ class Overlay(Painter):
         y = self._actions(d, y, on)
         if self.moves:
             self._moves(d, y, active_moves, moves_open)
-        if monitor:  # click areas only (painted separately by render_monitor); before the cards
-            pill, panel = monitor_view.rects(self, monitor)
-            self.regions.append(("monitor_toggle", None, pill))
-            if panel:
-                self.regions.append(("monitor_panel", None, panel))
+        # Click areas only (painted separately by render_monitor); before the cards.
+        self.regions += monitor_view.regions(self, monitor, focus, clocks)
         current = next((name for name in ORDER if is_open[name]), None)
         if current:  # after the arrows, so the card covers (and wins clicks over) the top one
             VIEWS[current].draw(self, d, cards[current])
         if alerts and not is_open["calendar"]:  # the calendar lists them itself
             bubbles.alert(self, d, alerts)
-        if gh_badge:  # over the cards: the badge floats on top of everything
+        for name, place in (badges or {}).items():  # over the cards: the icons float on top of everything
+            x, y = place()
+            self.regions.append(("app_badge", name, (x - 26, y - 30, x + 26, y + 30)))
+        if gh_badge:
             x, y = gh_badge()
             self.regions.append(("gh_badge", None, (x - 27, y - 32, x + 27, y + 30)))
         if voice:  # last: its Run/Cancel must never be covered
@@ -106,7 +113,9 @@ class Overlay(Painter):
         for name, label in self.buttons:
             rect = (12, y, PANEL_W - 12, y + BUTTON_H)
             active = {"talk": talk_left is not None, "dance": dancing, "pose": pose_label is not None,
-                      "think": thinking}.get(name, is_open.get(name))
+                      "think": thinking, "client": is_open["clients"]}.get(name, is_open.get(name))
+            if name == "client" and cards.get("clients", {}).get("current"):  # who you are working for
+                label = self.fit(cards["clients"]["current"], self.f_button, PANEL_W - 24 - 14 - 22)
             if name == "talk" and active:
                 label = f"Talking · {talk_left}s"
             elif name == "dance" and active:
@@ -127,10 +136,13 @@ class Overlay(Painter):
             badge = self._badge(name, cards)
             if badge and badge[0]:  # how many wait: open pendings, due reminders, endpoints, companies
                 cx, cy = rect[2] - 16, (rect[1] + rect[3]) / 2
-                if name in ("observe", "rules"):  # their labels are long: the badge sits on the corner
+                if name in ("observe", "rules", "vault"):  # long labels, or one with a badge to match: the badge sits on the corner
                     cx, cy = rect[2] - 4, rect[1] + 2
                 self.circle(cx, cy, 10, badge[1], edge=1.8)
                 d.text(self.s(cx, cy), str(badge[0]), font=self.f_mini, anchor="mm", fill=(255, 255, 255, 255))
+            if name == "client":  # it switches: a little ▾ (drawn, fonts may lack the glyph)
+                cx, cy = rect[2] - 16, (rect[1] + rect[3]) / 2
+                self.poly((cx - 4, cy - 2, cx + 4, cy - 2, cx, cy + 3), CARD if self.flash == ("button", name) else INK)
             self.regions.append(("button", name, rect))
             y += BUTTON_STEP
         return y
@@ -148,8 +160,12 @@ class Overlay(Painter):
         if name == "observe":  # endpoints registered: green while all answer
             eps = card["endpoints"]
             return len(eps), ALERT if any(e.get("ok") is False for e in eps) else GOOD
-        if name == "rules":  # companies with rules written down
+        if name == "rules":  # the client's rules (without a client: the companies)
+            if card.get("locked") and card.get("company") is not None:
+                return len(card["companies"][card["company"]]["rules"]), ACCENT
             return len(card["companies"]), ACCENT
+        if name == "vault":  # keys kept
+            return card["count"], INK
         return None
 
     def _column_height(self, active, opened):

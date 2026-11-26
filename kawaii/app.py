@@ -11,6 +11,7 @@ import io
 import os
 import random
 import signal
+import sys
 import time
 
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")  # must precede any OpenGL import
@@ -30,8 +31,9 @@ from kawaii.body.body import Body  # noqa: E402
 from kawaii.body.expressions import Expressions  # noqa: E402
 from kawaii.body.reactions import AgentReactions  # noqa: E402
 from kawaii.body.walk import Walker  # noqa: E402
-from kawaii.cards.base import Deck, Screen  # noqa: E402
+from kawaii.cards.base import Deck, Screen, middle  # noqa: E402
 from kawaii.cards.calendar import CalendarCard  # noqa: E402
+from kawaii.cards.clients import ClientsCard  # noqa: E402
 from kawaii.cards.decoder import DecoderCard  # noqa: E402
 from kawaii.cards.observe import ObserveCard  # noqa: E402
 from kawaii.cards.pendings import PendingsCard  # noqa: E402
@@ -39,14 +41,20 @@ from kawaii.cards.picker import PickerCard  # noqa: E402
 from kawaii.cards.prs import PRCard  # noqa: E402
 from kawaii.cards.rules import RulesCard  # noqa: E402
 from kawaii.cards.settings import SettingsCard  # noqa: E402
+from kawaii.cards.vault import VaultCard  # noqa: E402
 from kawaii.features import decode, prreview  # noqa: E402
 from kawaii.features.agents import WAITING, WATCHERS, WORKING  # noqa: E402
+from kawaii.features.clients import Clients  # noqa: E402
+from kawaii.features.apps import APPS  # noqa: E402
 from kawaii.features.observe import Pinger  # noqa: E402
 from kawaii.features.pendings import Pendings  # noqa: E402
 from kawaii.features.prwatch import PRWatcher  # noqa: E402
 from kawaii.features.reminders import Events  # noqa: E402
 from kawaii.features.rules import Rulebook  # noqa: E402
 from kawaii.features.sysmon import SystemMonitor  # noqa: E402
+from kawaii.features.vault import Vault  # noqa: E402
+from kawaii.clocks import Clocks  # noqa: E402
+from kawaii.focus import Focus, summary_sentence  # noqa: E402
 from kawaii.input.clipboard import Clipboard  # noqa: E402
 from kawaii.input.keys import load_hotkeys  # noqa: E402
 from kawaii.input.router import Router  # noqa: E402
@@ -54,6 +62,7 @@ from kawaii.layout.geometry import clamp_size  # noqa: E402
 from kawaii.layout.layout import DEFAULT_MARGIN, Layout  # noqa: E402
 from kawaii.layout.spots import Spots  # noqa: E402
 from kawaii.monitor_panel import MonitorPanel  # noqa: E402
+from kawaii import outfits  # noqa: E402
 from kawaii.process import animations_enabled, replace_running_copy  # noqa: E402
 from kawaii.render.fx import Effects  # noqa: E402
 from kawaii.render.gl import OverlayTexture, read_alpha, write_snapshot  # noqa: E402
@@ -84,11 +93,13 @@ class App:
         live2d.enableLog(False)
         live2d.init()
         live2d.glInit()
-        self.model = model = live2d.Model()
-        model.LoadModelJson(str(args.model))
-        model.Resize(*size)
-        model.SetAutoBlink(True)
-        model.SetAutoBreath(True)
+        # Who you work for: pendings, reminders, endpoints, rules, vault and her outfit are per client.
+        self.clients = Clients(paths.CONFIG_DIR)
+        for name in self.clients.names:
+            outfits.ensure_folder(name)  # assets/<client>/: drop a shirt.png there and she wears it
+        self.outfit = outfits.Outfit(outfits.client_folder(self.clients.current))
+        self.model_path = self._model_path(self.outfit)
+        self.model = model = self._new_model(self.model_path, size)
         self.hotkeys = load_hotkeys(args.model.parent / "hotkeys.json")
         self.expressions = Expressions(model)
         self.layout = Layout(model, win, store, left=left, size=size, default_size=default_size,
@@ -108,18 +119,20 @@ class App:
         # Background watchers and services.
         self.monitor = SystemMonitor()
         self.panel = MonitorPanel(self.monitor, store)
-        self.events = Events(paths.EVENTS_FILE)
-        self.alerts = Alerts(self.events, self.monitor)
+        space = self.clients.space(self.clients.current)
+        self.alerts = Alerts(Events(space.events), self.monitor)
         self.assistant = VoiceAssistant(paths.APP_DIR, paths.CONFIG_DIR)
         self.speaker = Speaker(paths.DATA_DIR / "kokoro", paths.CACHE_DIR / "tts", paths.ASSETS / "voice_lines.json")
         if not args.snapshot:
             self.speaker.prerender()  # her fixed lines, generated once in the background
-        self.agent_apps = [W() for W in WATCHERS]  # Kiro, Claude
+        self.mover = WindowMover()  # puts the windows of apps she opens on the monitor you chose; raises them
+        self.agent_apps = [W(windows=self.mover) for W in WATCHERS]  # Kiro, Claude
+        self.desk_apps = [A(windows=self.mover) for A in APPS]  # Warp, the browsers, Obsidian
+        self.apps = {a.name: a for a in self.agent_apps + self.desk_apps}
         self.badges = {}  # app name -> its floating icon, while the app is open
+        self.badge_spots = {}  # app name -> where its icon is (for its click area)
         self.prs = PRWatcher(paths.CONFIG_DIR / "prwatch.json")
-        self.pinger = Pinger(paths.CONFIG_DIR / "observe.json")  # the Observability endpoints
         self.gh_icon = paths.CONFIG_DIR / "github.png"  # optional: your own GitHub icon; a pull-request symbol otherwise
-        self.mover = WindowMover()  # puts the windows of apps she opens on the monitor you chose
         explainer = decode.Explainer(lambda system, text: openrouter(
             self.assistant.key_file, self.assistant.models, system, text, max_tokens=350))
 
@@ -127,17 +140,26 @@ class App:
         clipboard, head = Clipboard(), self.spots.head
         settings = SettingsCard(self.screen, store, self.mover, here=lambda: win.output.name if win.output else None)
         self.deck = Deck(
-            PendingsCard(self.screen, Pendings(paths.PENDINGS_FILE), on_change=lambda: self.layout.refresh_silhouette(0.7)),
-            CalendarCard(self.screen, self.events, self.alerts),
+            ClientsCard(self.screen, self.clients, on_switch=self.switch_client),
+            PendingsCard(self.screen, Pendings(space.pendings), on_change=lambda: self.layout.refresh_silhouette(0.7)),
+            CalendarCard(self.screen, self.alerts.events, self.alerts),
             DecoderCard(self.screen, clipboard, explainer, self.body, head),
             PickerCard(self.screen, prreview.Reviewer(), self.mover, settings.app_output, head),
-            ObserveCard(self.screen, self.pinger, clipboard),
+            ObserveCard(self.screen, Pinger(space.observe), clipboard),  # the Observability endpoints
             RulesCard(self.screen, Rulebook(paths.CONFIG_DIR / "rules.json"), clipboard),  # Business Rules, per company
+            VaultCard(self.screen, Vault(space.vault), clipboard),  # keys at hand, per reason
             PRCard(self.screen, self.prs),
             settings,
+            client=lambda: self.clients.current,
         )
+        self.deck["rules"].client_changed(space)  # Business Rules opens on this client's rules
         self.voice = VoiceBanner(self.screen, self.assistant, self.speaker, self.body, self.mover, settings.app_output)
 
+        self.focus = Focus(store)  # focus mode: she keeps quiet and counts what waits
+        self.focus_view, self.focus_shape = None, None
+        self.clocks = Clocks(store)  # customer clocks, under the Focus switch
+        self.clocks_view = None
+        self.agents_waiting = self.agents_working = 0
         self.moves_open = store.get("moves_open", True)  # mini move buttons expanded
         self.flash_until = None  # end of a button's inverted impact frame
         self.pose_seen = None  # last pose label, to flash on each new pose
@@ -179,14 +201,119 @@ class App:
         self.overlay.flash = hit
         self.flash_until = time.perf_counter() + 0.19
 
+    @property
+    def pinger(self):
+        """The current client's endpoints."""
+        return self.deck["observe"].pinger
+
+    def _model_path(self, outfit):
+        """The model wearing the client's outfit (built once, cached), or the plain one."""
+        if not outfit.active:
+            return self.args.model
+        try:
+            return outfits.build(self.args.model, outfit)
+        except (OSError, ValueError, KeyError) as e:
+            print(f"outfit: cannot dress her in {outfit.shirt}: {e}", file=sys.stderr)
+            return self.args.model
+
+    def _new_model(self, path, size):
+        model = live2d.Model()
+        model.LoadModelJson(str(path))
+        model.Resize(*size)
+        model.SetAutoBlink(True)
+        model.SetAutoBreath(True)
+        return model
+
+    def _dress(self, name):
+        """Put on the client's outfit: a new model only when it looks different."""
+        self.outfit = outfits.Outfit(outfits.ensure_folder(name))
+        path = self._model_path(self.outfit)
+        if path == self.model_path:
+            return
+        self.model_path = path
+        self.model = self.layout.model = self.expressions.model = self._new_model(path, self.layout.size)
+        for exp in self.expressions.active:
+            self.model.AddExpression(exp)
+        self.layout.set_transform(self.layout.scale, self.layout.offset)
+        self.layout.refresh_silhouette(0.3)
+
+    def _wear(self):
+        """Every frame, after the animation: the outfit's jacket choice (the rest is in its texture)."""
+        if not self.outfit.jacket:
+            self.model.SetParamById(outfits.JACKET_PARAM, 1.0)
+
+    def switch_client(self, name):
+        """Another client was picked in the Clients card: every module loads its data, and she
+        changes into that client's outfit."""
+        self._dress(name)
+        self.deck.client_changed(self.clients.space(name))
+        self.layout.refresh_silhouette(0.7)  # the Pendings hand may have come down
+        self.screen.redraw()
+        button = self.overlay.rect_of("button", "client")
+        if button:
+            self.fx.pop(button)
+
+    def focus_app(self, name, rect):
+        """Its floating icon was clicked: bring its window to the front (the next one, if it is
+        there already)."""
+        if self.mover.activate(self.apps[name].app_ids):
+            self.fx.pick(rect)
+        else:  # no window to raise (Claude Code in a terminal, or not on COSMIC)
+            self.fx.poof(*middle(rect), size=5)
+
+    def toggle_focus(self, rect):
+        """The Focus switch: she says so and goes quiet, or tells you what came in meanwhile."""
+        if self.focus.on:
+            self.focus.stop()
+            self._focus_done()
+        else:
+            self.react("focus_start", 1.5)
+            self.focus.start()
+            self.fx.pick(rect)
+        self.screen.redraw()
+
+    def _focus_done(self):
+        self.greet_if_free()
+        self.react("focus_done", 3, summary=summary_sentence(self._counts()))
+        bubble = self.overlay.rect_of("focus_toggle")
+        if bubble:
+            self.fx.nudge(bubble)
+
+    def _counts(self):
+        """Everything countable on screen, for the focus dropdown."""
+        return {"agents_waiting": self.agents_waiting, "agents_working": self.agents_working,
+                "pr_comments": len(self.prs.unread), "reminders": self.alerts.due_count,
+                "alarms": len(self.monitor.alarms), "endpoints_down": len(self.pinger.down),
+                "pendings": self.deck["pendings"].pendings.open_count}
+
+    def _watch_focus(self):
+        """The countdown, and repainting the switch and its dropdown when what they show changes."""
+        if self.focus.tick():
+            self._focus_done()
+        view = self.focus.payload(self._counts())
+        if view != self.focus_view:
+            self.focus_view, self.panel.dirty = view, True
+        clocks = self.clocks.payload()  # the customer clocks: a new minute repaints them
+        if clocks != self.clocks_view:
+            self.panel.dirty = True
+            if len(clocks["rows"]) != len((self.clocks_view or {}).get("rows", ())):
+                self.screen.redraw()  # their click area
+            self.clocks_view = clocks
+        shape = (view["on"], view["open"])  # its click areas
+        if shape != self.focus_shape:
+            self.focus_shape = shape
+            self.screen.redraw()
+
     def react(self, kind, silent_seconds, **fields):
-        """She says a line; with no voice she at least moves her mouth."""
+        """She says a line; with no voice she at least moves her mouth. Not while you focus."""
+        if self.focus.quiet:
+            return
         said = self.speaker.react(kind, **fields)
         if not (said and self.speaker.available):
             self.body.talk(silent_seconds)
 
     def greet_if_free(self):
-        if not self.body.busy:
+        if not self.body.busy and not self.focus.quiet:
             self.body.toggle(self.body.greeter)  # 'hey!' with a wave
 
     # -- the frame loop
@@ -253,7 +380,10 @@ class App:
             self._nag()
 
     def _nag(self):
-        """Get attention: a greeting (unless she is busy) and she says what is waiting."""
+        """Get attention: a greeting (unless she is busy) and she says what is waiting.
+        Not while you focus: the focus dropdown counts the reminders instead."""
+        if self.focus.quiet:
+            return
         self.greet_if_free()
         said, first = None, self.alerts.announcement()
         if first:
@@ -274,6 +404,7 @@ class App:
     def _move_body(self, dt):
         motion = self.body.update(self.model, dt, hand_up=self.deck["pendings"].is_open, room=self.layout.room(),
                                   offset=self.layout.offset, voice_mouth=self.speaker.mouth(time.monotonic()))
+        self._wear()
         if motion.settled:  # back at rest: measure her real outline again
             self.layout.refresh_silhouette(0.1)
         if motion.changed:  # button states / pose label changed
@@ -305,6 +436,8 @@ class App:
                 self.fx.later(0.5, lambda: self.fx.puzzled(*self.spots.head(), self.body.huh.side))
             else:  # "aha": the agents are done
                 self.fx.later(0.15, lambda: self.fx.idea(*self.spots.head(), self.body.thinker.side))
+        self._watch_apps(now)
+        self._watch_focus()
         self.deck.tick(now)  # the PR review handed to Kiro, the stack trace explanation
         self._watch_prs(now)
         self._watch_endpoints(now)
@@ -317,10 +450,9 @@ class App:
             is_open, doing = app.poll(now)
             badge = self.badges.get(app.name)
             if is_open and not badge:
-                badge = self.badges[app.name] = self.fx.badge(app.icon, lambda side=app.side: self.spots.agent(side))
+                badge = self._show_badge(app, lambda side=app.side: self.spots.agent(side))
             elif not is_open and badge:
-                badge.leave()
-                badge = self.badges.pop(app.name) and None
+                badge = self._hide_badge(app.name)
             if badge:
                 if badge.working and doing not in (WORKING, WAITING):  # this one is done
                     self.fx.kira(*self.spots.agent(app.side), r=12, life=0.7)
@@ -329,7 +461,35 @@ class App:
                 working.append(app.side)
             elif doing == WAITING:
                 waiting.append(app.side)
+        self.agents_working, self.agents_waiting = len(working), len(waiting)
         return working, waiting
+
+    def _watch_apps(self, now):
+        """Warp, the browsers and Obsidian: an icon by her head while each has a window."""
+        for app in self.desk_apps:
+            is_open, _ = app.poll(now)
+            if is_open and app.name not in self.badges:
+                self._show_badge(app, lambda name=app.name: self.spots.app(self._app_slot(name)), size=36)
+            elif not is_open and app.name in self.badges:
+                self._hide_badge(app.name)
+
+    def _app_slot(self, name):
+        """Its place among the open apps' icons, in a fixed order so they never swap around."""
+        shown = [a.name for a in self.desk_apps if a.name in self.badges]
+        return shown.index(name) if name in shown else len(shown)
+
+    def _show_badge(self, app, place, size=40):
+        badge = self.badges[app.name] = self.fx.badge(app.icon, place, size=size,
+                                                      glyph=None if app.icon else self.fx.letter(app.letter))
+        self.badge_spots[app.name] = place
+        self.screen.redraw()  # its click area
+        return badge
+
+    def _hide_badge(self, name):
+        self.badges.pop(name).leave()
+        self.badge_spots.pop(name, None)
+        self.screen.redraw()
+        return None
 
     def _watch_prs(self, now):
         """gh checks every 15 minutes in the background. New comments by others bring up the
@@ -415,14 +575,11 @@ class App:
     def _paint(self):
         screen, overlay, panel, body, deck = self.screen, self.overlay, self.panel, self.body, self.deck
         if screen.dirty or panel.dirty:  # hover/size changes affect the pill too
-            mon = panel.view()
-            if mon:
-                data, (mx, my, mw, mh) = overlay.render_monitor(mon)
-                if (mw, mh) != (self.monitor_tex.w, self.monitor_tex.h):
-                    self.monitor_tex.resize(mw, mh)
-                self.monitor_tex.upload(data)
-                panel.pos = (mx, my)
-            panel.dirty = False
+            data, (mx, my, mw, mh) = overlay.render_monitor(panel.view(), self.focus_view, self.clocks_view)
+            if (mw, mh) != (self.monitor_tex.w, self.monitor_tex.h):
+                self.monitor_tex.resize(mw, mh)
+            self.monitor_tex.upload(data)
+            panel.pos, panel.dirty = (mx, my), False
         if not screen.dirty:
             return
         self.overlay_tex.upload(overlay.render(
@@ -430,7 +587,8 @@ class App:
             self.moves_open, body.dancer.active, body.poser.label(),
             {"walk": body.walker.active, "greet": body.greeter.active, "huh": body.huh.active},
             alerts=self.alerts.items(), monitor=panel.view(), voice=self.voice.payload(),
-            thinking=body.thinker.active, gh_badge=self.spots.github if "github" in self.badges else None))
+            thinking=body.thinker.active, gh_badge=self.spots.github if "github" in self.badges else None,
+            badges=self.badge_spots, focus=self.focus_view, clocks=self.clocks_view))
         screen.dirty = False
         screen.region_dirty = True  # card size or handles may have changed
         banner = overlay.rect_of("voice_banner")
@@ -443,7 +601,7 @@ class App:
 
     def _draw_layers(self, dt):
         win = self.win
-        if self.panel.shape:  # under the main layer, so open cards cover the monitor panel
+        if self.focus_view:  # under the main layer, so open cards cover the monitor panel
             self.monitor_tex.draw(*self.panel.pos, window_h=win.height)
         self.overlay_tex.draw()
         self.fx.bounds = (win.width, win.height)

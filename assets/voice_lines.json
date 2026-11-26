@@ -58,6 +58,8 @@
  "pr_approved": ["Yay! {who} approved your {repo} pull request!", "Good news! {who} approved your pull request on {repo}."],
  "pr_changes": ["{who} asked for changes on your {repo} pull request.", "Hmm, {who} wants some changes on {repo}."],
  "endpoint_down": ["Uh oh! {title} isn't answering.", "Heads up! {title} looks down.", "Hmm, {title} stopped responding."],
+ "focus_start": ["Focus time! I'll keep quiet.", "Okay, deep work. I won't bother you.", "Go get it! I'll hold everything for later."],
+ "focus_done": ["Focus done! {summary}", "Welcome back! {summary}", "Time's up, great work! {summary}"],
  "alarms": {
   "cpu": "Heads up! Your CPU is working really hard.",
   "mem": "Your memory is almost full. Maybe close something?",

@@ -61,6 +61,7 @@ class Card:
     open_fx = "pick"  # "pop": pops open and poofs shut; "pick": a tap when opening
     hits = ()  # hit kinds this card's clicks go to
     scroll_hits = ()  # hit kinds over which the wheel scrolls this card
+    needs_client = False  # shows one client's data: opens only once a client is chosen
 
     def __init__(self, screen):
         self.screen = screen
@@ -93,14 +94,18 @@ class Card:
     def tick(self, now):
         """Every frame, open or not: background work coming back."""
 
+    def client_changed(self, space):
+        """Another client was picked: load its data (space says where it lives)."""
+
     def payload(self):
         """What the overlay needs to draw this card."""
         return {"open": self.is_open}
 
 
 class Deck:
-    def __init__(self, *cards):
+    def __init__(self, *cards, client=lambda: True):
         self.cards = {c.name: c for c in cards}
+        self.client = client  # the client picked, or None: cards with client data wait for one
         for c in cards:
             c.deck = self
 
@@ -135,6 +140,11 @@ class Deck:
             if hit == card.opener:
                 if button != BTN_LEFT:
                     return False
+                if card.needs_client and not self.client() and "clients" in self.cards:
+                    self.show("clients")  # first things first
+                    self.cards["clients"].status = "Choose a client first"
+                    card.fx.pop(rect)
+                    return True
                 if self.toggle(card.name):
                     card.fx.pop(rect) if card.open_fx == "pop" else card.fx.pick(rect)
                 elif card.open_fx == "pop":
@@ -163,3 +173,10 @@ class Deck:
     def tick(self, now):
         for card in self.cards.values():
             card.tick(now)
+
+    def client_changed(self, space):
+        """Close whatever is open, then every card loads the new client's data."""
+        if self.current:
+            self.show(self.current.name, False)
+        for card in self.cards.values():
+            card.client_changed(space)

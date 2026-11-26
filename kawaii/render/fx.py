@@ -617,6 +617,20 @@ class Effects:
         return badge
 
     @staticmethod
+    def letter(text):
+        """A glyph for an app badge without an icon file: its letter in white on ink."""
+        def glyph(ctx, size):
+            ctx.set_source_rgb(*INK)
+            ctx.paint()
+            ctx.select_font_face("sans-serif", cairo.FONT_SLANT_ITALIC, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(size * 0.6)
+            xb, yb, w, h = ctx.text_extents(text)[:4]
+            ctx.move_to(-w / 2 - xb, -h / 2 - yb)
+            ctx.set_source_rgb(*FILL)
+            ctx.show_text(text)
+        return glyph
+
+    @staticmethod
     def pull_request(ctx, size):
         """A pull-request symbol (two commits, the branch merging back with an arrow) in white
         on ink, for the GitHub badge when there is no icon file."""

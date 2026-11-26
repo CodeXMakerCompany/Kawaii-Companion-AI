@@ -65,3 +65,6 @@ class FakeClipboard:
         if self.works:
             self.text = text
         return self.works
+
+    def clear(self):
+        self.text = ""

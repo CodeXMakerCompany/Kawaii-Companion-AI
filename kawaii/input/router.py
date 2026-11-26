@@ -11,13 +11,17 @@ TALK_SECONDS = 10
 # UI element kinds that react to a click (pointer cursor + hover highlight).
 CLICKABLE = ("button", "item", "move", "moves_toggle", "action", "cal_prev", "cal_next", "cal_day", "cal_save",
              "cal_new", "cal_delete", "cal_event", "cal_done", "cal_yearly", "alert_action", "monitor_toggle",
-             "mic", "voice_run", "voice_cancel", "gh_badge", "dec_paste", "dec_run", "dec_clear", "dec_copy",
-             "dec_explain", "pk_row", "pk_back", "pk_open", "pk_cancel", "set_mon", "set_done",
+             "mic", "voice_run", "voice_cancel", "gh_badge", "app_badge", "dec_paste", "dec_run", "dec_clear",
+             "dec_copy", "dec_explain", "pk_row", "pk_back", "pk_open", "pk_cancel", "set_mon", "set_done",
              "obs_add", "obs_paste", "obs_check", "obs_done", "obs_row", "obs_input", "obs_title_in",
-             "rules_add", "rules_paste", "rules_copy", "rules_back", "rules_done", "rules_row")
+             "rules_add", "rules_paste", "rules_copy", "rules_back", "rules_done", "rules_row",
+             "vault_add", "vault_paste", "vault_back", "vault_done", "vault_temp", "vault_row", "vault_name_in",
+             "vault_key_in", "vault_input", "focus_toggle", "focus_open", "focus_plus", "focus_end",
+             "clocks_more", "client_row", "client_add", "client_done")
 # Clicking these just keeps keyboard focus here (no drag).
 PASSIVE = ("card", "cal_card", "cal_input", "alert", "monitor_panel", "voice_banner", "pr_card", "dec_card",
-           "dec_input", "pk_card", "pk_filter", "set_card", "obs_card", "rules_card", "rules_input")
+           "dec_input", "pk_card", "pk_filter", "set_card", "obs_card", "rules_card", "rules_input", "vault_card",
+           "focus_panel", "clocks", "client_card", "client_input")
 ROUTINE_BUTTONS = (("button", "dance"), ("button", "pose"), ("button", "think"), ("action", "walk"),
                    ("action", "greet"), ("action", "huh"))
 
@@ -94,7 +98,21 @@ class Router:
         """Left clicks on everything that is not a card. True when the hit was one."""
         app, fx = self.app, self.app.fx
         kind = hit[0]
-        if kind == "alert_action":
+        if kind == "app_badge":
+            app.focus_app(hit[1], rect)
+        elif kind == "clocks_more":
+            app.clocks.toggle()
+            app.screen.redraw()
+        elif kind == "focus_toggle":
+            app.toggle_focus(rect)
+        elif kind == "focus_open":
+            app.focus.open = not app.focus.open
+            app.screen.redraw()
+        elif kind in ("focus_plus", "focus_end"):
+            app.screen.press(hit)
+            app.focus.extend() if kind == "focus_plus" else app.focus.stop()
+            app.screen.redraw()
+        elif kind == "alert_action":
             fx.tap(rect)
             app.alerts.handle(hit[1])
             app.screen.redraw()

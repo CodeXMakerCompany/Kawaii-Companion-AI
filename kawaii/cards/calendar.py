@@ -4,6 +4,7 @@ nags until Done. Clicking a reminder edits it, right-click deletes it."""
 import datetime
 
 from kawaii.cards.base import Card, middle
+from kawaii.features.reminders import Events
 from kawaii.input.keys import BTN_LEFT, BTN_RIGHT, ENTER, KEY_BACKSPACE, KEY_ESC
 from kawaii.input.textfield import erase
 
@@ -14,6 +15,7 @@ class CalendarCard(Card):
     open_fx = "pop"
     hits = ("cal_prev", "cal_next", "cal_day", "cal_save", "cal_new", "cal_yearly", "cal_delete", "cal_done",
             "cal_event")
+    needs_client = True
 
     def __init__(self, screen, events, alerts, today=datetime.date.today):
         super().__init__(screen)
@@ -24,6 +26,11 @@ class CalendarCard(Card):
         self.draft = ""
         self.editing = None  # id of the reminder being edited
         self.yearly = False  # Yearly switch for the reminder being added/edited
+
+    def client_changed(self, space):
+        self.events = self.alerts.events = Events(space.events)  # her reminders follow the client too
+        self._forget_editing()
+        self.alerts.recheck()
 
     def opened(self):
         if not self.editing:

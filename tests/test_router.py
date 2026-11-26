@@ -167,3 +167,42 @@ def test_hover_shows_a_pointer_over_clickable_things(tmp_path):
     app.overlay.under = ("handle", "left")
     router.on_motion(0, 300)
     assert app.win.cursor == "ew_resize"
+
+
+def test_clicking_a_floating_app_icon_raises_its_window(tmp_path):
+    app, router = make(tmp_path)
+    raised = []
+    app.focus_app = lambda name, rect: raised.append((name, rect))
+    app.overlay.rects[("app_badge", "warp")] = (1, 2, 3, 4)
+    click(app, router, ("app_badge", "warp"))
+    assert raised == [("warp", (1, 2, 3, 4))]
+    assert app.layout.drag is None
+
+
+def test_app_icons_show_a_pointer(tmp_path):
+    app, router = make(tmp_path)
+    app.overlay.under = ("app_badge", "brave")
+    router.on_motion(10, 10)
+    assert app.win.cursor == "pointer"
+
+
+def test_focus_switch_dropdown_and_buttons(tmp_path):
+    app, router = make(tmp_path)
+    calls = []
+    app.toggle_focus = lambda rect: calls.append("toggle")
+    app.focus = SimpleNamespace(open=False, extend=lambda: calls.append("plus"), stop=lambda: calls.append("end"))
+    for hit in (("focus_toggle", None), ("focus_open", None), ("focus_plus", None), ("focus_end", None)):
+        app.overlay.rects[hit] = (0, 0, 10, 10)
+        click(app, router, hit)
+    assert calls == ["toggle", "plus", "end"]
+    assert app.focus.open is True
+    assert app.layout.drag is None
+
+
+def test_clicking_the_clocks_toggle_folds_the_cloud_zones(tmp_path):
+    app, router = make(tmp_path)
+    folds = []
+    app.clocks = SimpleNamespace(toggle=lambda: folds.append(1))
+    app.overlay.rects[("clocks_more", None)] = (0, 0, 10, 10)
+    click(app, router, ("clocks_more", None))
+    assert folds == [1] and app.layout.drag is None

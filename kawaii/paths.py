@@ -12,5 +12,3 @@ DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) /
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "shark-viewer"
 
 STATE_FILE = CONFIG_DIR / "state.json"
-PENDINGS_FILE = CONFIG_DIR / "pendings.json"
-EVENTS_FILE = CONFIG_DIR / "events.json"

@@ -1,4 +1,5 @@
-"""Put app windows she opens on the monitor you chose (COSMIC).
+"""Put app windows she opens on the monitor you chose, and raise an app's window when its
+floating icon is clicked (COSMIC).
 
 On Wayland an app can't pick its monitor: COSMIC opens a new window where you last were,
 which is wherever she is when you click her buttons. COSMIC's toplevel manager can move a
@@ -10,6 +11,7 @@ thread, and moves a window you asked for once it shows up.
 The COSMIC protocol bindings are in protocols/ (generated from protocols-xml/).
 """
 
+import array
 import select
 import sys
 import threading
@@ -18,12 +20,26 @@ import time
 from pywayland.client import Display
 from pywayland.protocol.ext_foreign_toplevel_list_v1 import ExtForeignToplevelListV1
 from pywayland.protocol.ext_workspace_v1 import ExtWorkspaceManagerV1
-from pywayland.protocol.wayland import WlOutput
+from pywayland.protocol.wayland import WlOutput, WlSeat
 
 from kawaii.wayland.protocols.cosmic_toplevel_info_unstable_v1 import ZcosmicToplevelInfoV1
 from kawaii.wayland.protocols.cosmic_toplevel_management_unstable_v1 import ZcosmicToplevelManagerV1
 
 ACTIVE = 1  # ext_workspace_handle_v1 state bit
+ACTIVATED = 2  # zcosmic_toplevel_handle_v1 state: the window has the focus
+
+
+def pick_window(windows, app_ids):
+    """Which of an app's windows a click on its icon raises: the one you used last; when one
+    of them is already in front, the next one (so clicking again goes through them)."""
+    ids = {a.lower() for a in app_ids}
+    mine = sorted((w for w in windows if w["app"].lower() in ids), key=lambda w: w["seen"])
+    if not mine:
+        return None
+    front = next((i for i, w in enumerate(mine) if w["active"]), None)
+    if front is not None:
+        return mine[(front + 1) % len(mine)]
+    return max(mine, key=lambda w: w["last_active"])
 
 
 class WindowMover:
@@ -35,6 +51,7 @@ class WindowMover:
         self._workspaces = {}  # workspace -> {"active": bool}
         self._windows = {}  # foreign toplevel -> {"app", "title", "outputs", "cosmic", "seen"}
         self._wanted = []  # moves asked for, not done yet
+        self._raise = []  # app ids of windows to raise, asked for from the main thread
         self._lock = threading.Lock()
         threading.Thread(target=self._run, daemon=True, name="winmove").start()
 
@@ -54,6 +71,18 @@ class WindowMover:
                                  "since": time.monotonic() - lookback, "until": time.monotonic() + seconds,
                                  "window": None, "next_try": 0.0})
 
+    def has_window(self, app_ids):
+        ids = {a.lower() for a in app_ids}
+        return any(w["app"].lower() in ids for w in list(self._windows.values()))
+
+    def activate(self, app_ids):
+        """Raise one of the app's windows (see pick_window). False when it has none here."""
+        if not (self.available and self.has_window(app_ids)):
+            return False
+        with self._lock:
+            self._raise.append(tuple(app_ids))
+        return True
+
     # ---- the connection --------------------------------------------------------
 
     def _run(self):
@@ -69,6 +98,7 @@ class WindowMover:
             if readable:
                 self.display.dispatch(block=True)  # data is waiting: this reads it, it doesn't block
             self._move_due()
+            self._raise_due()
 
     def _connect(self):
         self.display = Display()
@@ -82,6 +112,9 @@ class WindowMover:
                       "ext_workspace_manager_v1"):
             if iface not in found:
                 raise RuntimeError(f"no {iface}")
+        if "wl_seat" not in found:
+            raise RuntimeError("no wl_seat")
+        self.seat = registry.bind(found["wl_seat"][0][0], WlSeat, 1)  # raising a window needs one
         for name, version in found.get("wl_output", []):
             self._add_output(registry.bind(name, WlOutput, min(version, 4)))
         self.manager = registry.bind(found["zcosmic_toplevel_manager_v1"][0][0], ZcosmicToplevelManagerV1, 4)
@@ -129,12 +162,31 @@ class WindowMover:
     def _add_window(self, _, handle):
         # The COSMIC handle tells which monitor it is on (that arrives a moment later).
         win = self._windows[handle] = {"app": "", "title": "", "outputs": set(), "seen": time.monotonic(),
+                                       "active": False, "last_active": 0.0,
                                        "cosmic": self.info.get_cosmic_toplevel(handle)}
         handle.dispatcher["app_id"] = lambda _, a: win.update(app=a)
         handle.dispatcher["title"] = lambda _, t: win.update(title=t)
         handle.dispatcher["closed"] = lambda _: self._windows.pop(handle, None)
         win["cosmic"].dispatcher["output_enter"] = lambda _, o: win["outputs"].add(o)
         win["cosmic"].dispatcher["output_leave"] = lambda _, o: win["outputs"].discard(o)
+
+        def state(_, states):
+            if isinstance(states, (bytes, bytearray)):
+                states = array.array("I", states)
+            win["active"] = ACTIVATED in states
+            if win["active"]:
+                win["last_active"] = time.monotonic()
+        win["cosmic"].dispatcher["state"] = state
+
+    # ---- raising -----------------------------------------------------------------
+
+    def _raise_due(self):
+        with self._lock:
+            asked, self._raise = self._raise, []
+        for app_ids in asked:
+            win = pick_window(list(self._windows.values()), app_ids)
+            if win:
+                self.manager.activate(win["cosmic"], self.seat)
 
     # ---- moving ------------------------------------------------------------------
 

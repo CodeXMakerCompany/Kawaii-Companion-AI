@@ -114,8 +114,9 @@ def draw(p, d, rb):
 
     y = bottom - pad - 18 - buttons_h + 6
     bx = x0 + pad
-    buttons = [("rules_back", "‹ Back", CARD), ("rules_add", "Add", PRI), ("rules_paste", "Paste", CARD),
-               ("rules_copy", "Copy all", CARD)] if company else \
+    back = [] if rb.get("locked") else [("rules_back", "‹ Back", CARD)]  # one client's rules: no list to go back to
+    buttons = back + [("rules_add", "Add", PRI), ("rules_paste", "Paste", CARD),
+                      ("rules_copy", "Copy all", CARD)] if company else \
         [("rules_add", "Open", PRI), ("rules_paste", "Paste", CARD)]
     for kind, label, fill in buttons + [("rules_done", "Done", CARD)]:
         w = p.f_mini.getlength(label) / p.px + 24

@@ -2,6 +2,7 @@
 Type + Enter adds, click toggles done, right-click deletes, Esc closes."""
 
 from kawaii.cards.base import Card
+from kawaii.features.pendings import Pendings
 from kawaii.input.keys import BTN_LEFT, BTN_RIGHT, ENTER, KEY_BACKSPACE, KEY_ESC
 from kawaii.input.textfield import erase
 
@@ -11,12 +12,16 @@ class PendingsCard(Card):
     opener = ("button", "pendings")
     open_fx = "pop"
     hits = ("item",)
+    needs_client = True
 
     def __init__(self, screen, pendings, on_change):
         super().__init__(screen)
         self.pendings = pendings
         self.on_change = on_change  # her hand moves, so her outline changes
         self.draft = ""
+
+    def client_changed(self, space):
+        self.pendings, self.draft = Pendings(space.pendings), ""
 
     def opened(self):
         self.pendings.roll_day()

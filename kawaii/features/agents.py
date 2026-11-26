@@ -30,38 +30,32 @@ import re
 import time
 from pathlib import Path
 
-IDLE, WORKING, WAITING = "idle", "working", "waiting"
+from kawaii.features.apps import IDLE, AppWatcher
+
+WORKING, WAITING = "working", "waiting"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 RECENT = 600  # log files untouched for longer are not followed (unless waiting on you)
 WAIT_LIMIT = 3600  # a question unanswered for an hour is forgotten
 FIRST_READ = 512 * 1024  # bytes read back from the end of a log seen for the first time
 
 
-class AgentWatcher:
-    """The shared part: the app's process, and following the end of its log files."""
+class AgentWatcher(AppWatcher):
+    """An app whose agents it follows through the end of its log files."""
 
-    name = ""
-    processes = ()  # /proc/<pid>/comm of the app's processes
-    icons = ()  # icon files of the installed app; the first that exists is used
     logs = ""  # glob of the log files to follow
     stale = 180  # seconds of a quiet log before a working run counts as over
-    side = 1  # where its icon floats beside her head: 1 right, -1 left
+    by_window = False  # open while its process runs: Claude Code in a terminal has no Claude window
 
-    def __init__(self, interval=1.0):
-        self.interval = interval
-        self.next_check = 0.0
-        self.open, self.state = False, IDLE
+    def __init__(self, windows=None, interval=1.0):
+        super().__init__(windows, interval)
         self.files = {}  # path -> {"offset": bytes read so far, "state": ..., plus parser notes}
-        self.pid = None
-        self.next_scan = 0.0  # when to look through /proc again while the app is closed
-        self.icon = next((p for p in self.icons if os.path.exists(p)), None)
 
     def poll(self, now):
         """Look again when due; returns (the app is open, IDLE / WORKING / WAITING)."""
         if now < self.next_check:
             return self.open, self.state
         self.next_check = now + self.interval
-        self.open = self._running(now)
+        self.open = self._is_open(now)
         if not self.open:
             self.files.clear()
             self.state = IDLE
@@ -98,26 +92,10 @@ class AgentWatcher:
         """Read newly appended lines (oldest first) into log["state"]."""
         raise NotImplementedError
 
-    def _running(self, now):
-        if self.pid and self._is_app(self.pid):
-            return True
-        self.pid = None
-        if now < self.next_scan:
-            return False
-        self.next_scan = now + 3.0  # closed: no need to read all of /proc every second
-        self.pid = next((int(p) for p in os.listdir("/proc") if p.isdigit() and self._is_app(p)), None)
-        return self.pid is not None
-
-    def _is_app(self, pid):
-        try:
-            with open(f"/proc/{pid}/comm", "rb") as f:
-                return f.read().strip() in self.processes
-        except OSError:
-            return False
-
 
 class Kiro(AgentWatcher):
-    name = "kiro"
+    name, letter = "kiro", "K"
+    app_ids = ("kiro",)
     processes = (b"kiro",)
     icons = ("/usr/share/kiro/resources/app/resources/linux/code.png",
              "/usr/share/kiro/resources/app/extensions/kiro.kiro-agent/extension-resources/kiro-icon.png")
@@ -142,7 +120,8 @@ class Kiro(AgentWatcher):
 
 
 class Claude(AgentWatcher):
-    name = "claude"
+    name, letter = "claude", "C"
+    app_ids = ("com.anthropic.claude", "claude-desktop", "claude")
     processes = (b"claude-desktop", b"claude")  # the desktop app, or Claude Code in a terminal
     icons = ("/usr/share/icons/hicolor/256x256/apps/claude-desktop.png", "/usr/lib/claude-desktop/resources/icon.png")
     logs = str(Path.home() / ".claude" / "projects" / "*" / "*.jsonl")
